@@ -26,6 +26,7 @@
 pub mod compaction;
 pub mod db;
 pub mod error;
+pub mod iter;
 pub mod manifest;
 pub mod memtable;
 pub mod sstable;
