@@ -4,8 +4,9 @@
 //! replay, orphan `.sst` cleanup, WAL replay (including a torn tail), and re-flushing whatever
 //! was left in the WAL at close time.
 
-use driftdb::{Db, Options};
+use driftdb::{Db, Options, WriteBatch};
 use std::io::Write;
+use std::time::Duration;
 use tempfile::TempDir;
 
 const N: usize = 1_000;
@@ -17,6 +18,25 @@ fn val(i: usize) -> String {
     format!("v{i}")
 }
 
+/// Write every `(key, value)` pair via chunked `write_batch` calls instead of one `put` per
+/// pair -- same end state (every op still lands, in order, durably), far fewer fsyncs than
+/// awaiting each op one at a time.
+async fn put_all(db: &Db, items: impl IntoIterator<Item = (String, String)>) {
+    const CHUNK: usize = 200;
+    let mut batch = WriteBatch::new();
+    for (k, v) in items {
+        batch = batch.put(k.into_bytes(), v.into_bytes());
+        if batch.len() >= CHUNK {
+            db.write_batch(std::mem::take(&mut batch))
+                .await
+                .expect("write_batch");
+        }
+    }
+    if !batch.is_empty() {
+        db.write_batch(batch).await.expect("write_batch");
+    }
+}
+
 #[tokio::test]
 async fn reopen_sees_previously_written_keys() {
     let dir = TempDir::new().expect("tempdir");
@@ -24,11 +44,7 @@ async fn reopen_sees_previously_written_keys() {
 
     {
         let db = Db::open(&path).await.expect("open #1");
-        for i in 0..N {
-            db.put(key(i).as_bytes(), val(i).as_bytes())
-                .await
-                .expect("put");
-        }
+        put_all(&db, (0..N).map(|i| (key(i), val(i)))).await;
         // Implicit drop here -- WAL records are durable thanks to group-commit fsync, but no
         // explicit close()/flush() is called.
     }
@@ -51,11 +67,7 @@ async fn reopen_after_explicit_flush_serves_from_sstables_only() {
 
     {
         let db = Db::open(&path).await.expect("open #1");
-        for i in 0..N {
-            db.put(key(i).as_bytes(), val(i).as_bytes())
-                .await
-                .expect("put");
-        }
+        put_all(&db, (0..N).map(|i| (key(i), val(i)))).await;
         db.flush().await.expect("flush");
         let stats = db.stats();
         assert!(
@@ -79,17 +91,9 @@ async fn reopen_with_data_split_across_sstables_and_wal() {
 
     {
         let db = Db::open(&path).await.expect("open #1");
-        for i in 0..N / 2 {
-            db.put(key(i).as_bytes(), val(i).as_bytes())
-                .await
-                .expect("put");
-        }
+        put_all(&db, (0..N / 2).map(|i| (key(i), val(i)))).await;
         db.flush().await.expect("flush first half to L0");
-        for i in N / 2..N {
-            db.put(key(i).as_bytes(), val(i).as_bytes())
-                .await
-                .expect("put");
-        }
+        put_all(&db, (N / 2..N).map(|i| (key(i), val(i)))).await;
         // Second half stays in the WAL only -- no flush, no close.
     }
 
@@ -107,17 +111,14 @@ async fn deletes_survive_reopen() {
 
     {
         let db = Db::open(&path).await.expect("open #1");
-        for i in 0..N {
-            db.put(key(i).as_bytes(), val(i).as_bytes())
-                .await
-                .expect("put");
-        }
+        put_all(&db, (0..N).map(|i| (key(i), val(i)))).await;
         db.flush().await.expect("flush");
-        for i in 0..N {
-            if i % 3 == 0 {
-                db.delete(key(i).as_bytes()).await.expect("delete");
-            }
+
+        let mut batch = WriteBatch::new();
+        for i in (0..N).filter(|i| i % 3 == 0) {
+            batch = batch.delete(key(i).into_bytes());
         }
+        db.write_batch(batch).await.expect("write_batch deletes");
     }
 
     let db = Db::open(&path).await.expect("open #2");
@@ -169,11 +170,7 @@ async fn torn_wal_tail_is_truncated_and_acked_data_survives() {
 
     {
         let db = Db::open(&path).await.expect("open #1");
-        for i in 0..N {
-            db.put(key(i).as_bytes(), val(i).as_bytes())
-                .await
-                .expect("put");
-        }
+        put_all(&db, (0..N).map(|i| (key(i), val(i)))).await;
         db.close().await.expect("close");
     }
 
@@ -251,11 +248,7 @@ async fn small_options_reopen_roundtrip() {
         let db = Db::open_with(&path, options.clone())
             .await
             .expect("open #1");
-        for i in 0..2_000 {
-            db.put(key(i).as_bytes(), val(i).repeat(4).as_bytes())
-                .await
-                .expect("put");
-        }
+        put_all(&db, (0..2_000).map(|i| (key(i), val(i).repeat(4)))).await;
         db.compact().await.expect("compact");
     }
 
@@ -264,4 +257,67 @@ async fn small_options_reopen_roundtrip() {
         let got = db.get(key(i).as_bytes()).await.expect("get");
         assert_eq!(got.as_deref(), Some(val(i).repeat(4).as_bytes()));
     }
+}
+
+/// Regression test for the flush-failure deadlock: once `fatal` is set, the frozen memtable that
+/// failed to flush used to stay in `immutables` forever, and the background thread's shutdown
+/// condition (`shutdown && immutables.is_empty() && !force_compact`) could then never become
+/// true -- `close()` (and a plain `Drop`) would hang forever joining that thread.
+#[tokio::test]
+async fn close_after_flush_failure_does_not_hang() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().to_path_buf();
+
+    // Pre-place a directory at every SST path this scenario could plausibly need, so the first
+    // real flush's `File::create(&sst_path)` deterministically fails with "is a directory" --
+    // no filesystem-permission timing games, no race against the background thread picking up
+    // the newly-frozen memtable before we can sabotage it. This still stands in for any flush
+    // failure (full disk, permissions, ...) without depending on exactly how many file numbers
+    // `open()`/`flush()` burn internally.
+    for n in 1..=10u64 {
+        std::fs::create_dir(path.join(format!("{n:06}.sst"))).expect("landmine dir");
+    }
+
+    let db = Db::open(&path).await.expect("open");
+    db.put(b"a", b"1").await.expect("put");
+
+    let flush_result = db.flush().await;
+    assert!(
+        flush_result.is_err(),
+        "flush should fail once its SST path is blocked by a directory"
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), db.close())
+        .await
+        .expect("close() must not hang after a flush failure")
+        .expect("close");
+}
+
+/// Regression test: repeatedly opening and closing a db that's never written to used to leave
+/// one empty `wal-*.log` behind per cycle forever (nothing ever deleted a WAL that replayed to
+/// zero records). Now the empty ones get cleaned up on the next open.
+#[tokio::test]
+async fn empty_reopen_cycles_do_not_pile_up_wal_files() {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().to_path_buf();
+
+    for _ in 0..5 {
+        let db = Db::open(&path).await.expect("open");
+        db.close().await.expect("close");
+    }
+
+    let wal_count = std::fs::read_dir(&path)
+        .expect("read_dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("wal-") && n.ends_with(".log"))
+        })
+        .count();
+    assert!(
+        wal_count <= 1,
+        "expected at most 1 leftover wal file after 5 empty open/close cycles, found {wal_count}"
+    );
 }

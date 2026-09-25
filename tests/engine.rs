@@ -4,6 +4,7 @@
 
 use driftdb::{Db, Options, WriteBatch};
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -61,18 +62,32 @@ async fn random_workload_matches_btreemap_model_across_flush_and_compact() {
     let mut rng = Rng::new(42);
     const KEYSPACE: u64 = 500;
     const OPS: usize = 22_000;
+    // ponytail: batching ops through `write_batch` instead of awaiting one `put`/`delete` per
+    // op is what took this test from ~150s to a couple of seconds -- each `write_batch` call is
+    // still just one fsync, same as a single `put` was, so this doesn't weaken durability
+    // coverage, it just stops paying for 22,000 of them individually. `BATCH` ops still land in
+    // the same relative order (one `write_batch` awaited fully before the next is built), so the
+    // model stays exact and flush/compact still land at the same op boundaries.
+    const BATCH: usize = 64;
 
+    let mut batch = WriteBatch::new();
     for i in 0..OPS {
         let k = format!("key-{:05}", rng.below(KEYSPACE)).into_bytes();
         if rng.below(5) == 0 && model.contains_key(&k) {
-            db.delete(&k).await.expect("delete");
+            batch = batch.delete(k.clone());
             model.remove(&k);
         } else {
             let v = format!("val-{i}-{}", rng.next_u64()).into_bytes();
-            db.put(&k, &v).await.expect("put");
+            batch = batch.put(k.clone(), v.clone());
             model.insert(k, v);
         }
 
+        let boundary = i == OPS / 3 || i == 2 * OPS / 3;
+        if batch.len() >= BATCH || boundary || i + 1 == OPS {
+            db.write_batch(std::mem::take(&mut batch))
+                .await
+                .expect("write_batch");
+        }
         if i == OPS / 3 {
             db.flush().await.expect("mid-workload flush");
         }
@@ -252,15 +267,21 @@ async fn reopen_at_the_end_equals_model() {
     {
         let db = Db::open_with(&path, small_options()).await.expect("open");
         let mut rng = Rng::new(7);
+        let mut batch = WriteBatch::new();
         for i in 0..5_000usize {
             let k = format!("k{:05}", rng.below(400)).into_bytes();
             if rng.below(4) == 0 && model.contains_key(&k) {
-                db.delete(&k).await.expect("delete");
+                batch = batch.delete(k.clone());
                 model.remove(&k);
             } else {
                 let v = format!("v{i}").into_bytes();
-                db.put(&k, &v).await.expect("put");
+                batch = batch.put(k.clone(), v.clone());
                 model.insert(k, v);
+            }
+            if batch.len() >= 64 || i + 1 == 5_000 {
+                db.write_batch(std::mem::take(&mut batch))
+                    .await
+                    .expect("write_batch");
             }
         }
         db.compact().await.expect("compact");
@@ -268,4 +289,215 @@ async fn reopen_at_the_end_equals_model() {
 
     let db = Db::open_with(&path, small_options()).await.expect("reopen");
     assert_matches_model(&db, &model).await;
+}
+
+/// Regression test for `rotate()` returning `None` (nothing to wait for) whenever the active
+/// memtable happened to be empty, even if an already-frozen memtable was still mid-flush. That
+/// made `flush()`/`compact()` return early without actually waiting, so `compact()` could race
+/// ahead of a flush that hadn't landed yet.
+#[tokio::test]
+async fn compact_waits_for_a_flush_started_by_auto_rotate() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut opts = small_options();
+    opts.memtable_size = 4 * 1024; // small enough that a handful of puts auto-rotates.
+    let db = Db::open_with(dir.path(), opts).await.expect("open");
+
+    // Write just enough to cross `memtable_size` and trigger an auto-rotate; the active
+    // memtable is then empty again (everything moved into `immutables`) with nothing more
+    // queued behind it.
+    let mut batch = WriteBatch::new();
+    for i in 0..500u32 {
+        batch = batch.put(format!("k{i:04}").into_bytes(), vec![b'x'; 32]);
+    }
+    db.write_batch(batch).await.expect("write_batch");
+
+    db.compact().await.expect("compact");
+
+    let stats = db.stats();
+    assert_eq!(
+        stats.memtable_bytes, 0,
+        "compact() must wait for the auto-rotated memtable to actually flush"
+    );
+    assert_eq!(
+        stats.level_files.first().copied().unwrap_or(0),
+        0,
+        "forced compaction should have drained L0 too"
+    );
+}
+
+/// `Bound::Excluded` on either end of a scan must actually exclude that key -- covers
+/// `Excluded`/`Included`/`Unbounded` on both ends, and both `Db::scan` and `Snapshot::scan`
+/// (they share the same `scan_at` implementation).
+#[tokio::test]
+async fn scan_bounds_are_exact() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = Db::open_with(dir.path(), small_options())
+        .await
+        .expect("open");
+
+    for i in 0..10u32 {
+        let k = format!("k{i:02}").into_bytes();
+        let v = format!("v{i}").into_bytes();
+        db.put(&k, &v).await.expect("put");
+    }
+
+    let keys = |pairs: Vec<(Vec<u8>, Vec<u8>)>| -> Vec<String> {
+        pairs
+            .into_iter()
+            .map(|(k, _)| String::from_utf8(k).unwrap())
+            .collect()
+    };
+
+    // Excluded start: "k03" itself must not appear.
+    let got = db
+        .scan((
+            Bound::Excluded(b"k03".to_vec()),
+            Bound::Excluded(b"k06".to_vec()),
+        ))
+        .await
+        .expect("scan");
+    assert_eq!(keys(got), vec!["k04", "k05"]);
+
+    // Included start, Excluded end.
+    let got = db
+        .scan((
+            Bound::Included(b"k03".to_vec()),
+            Bound::Excluded(b"k06".to_vec()),
+        ))
+        .await
+        .expect("scan");
+    assert_eq!(keys(got), vec!["k03", "k04", "k05"]);
+
+    // Included start, Included end.
+    let got = db
+        .scan((
+            Bound::Included(b"k03".to_vec()),
+            Bound::Included(b"k06".to_vec()),
+        ))
+        .await
+        .expect("scan");
+    assert_eq!(keys(got), vec!["k03", "k04", "k05", "k06"]);
+
+    // Excluded start, Unbounded end.
+    let got = db
+        .scan((Bound::Excluded(b"k07".to_vec()), Bound::Unbounded))
+        .await
+        .expect("scan");
+    assert_eq!(keys(got), vec!["k08", "k09"]);
+
+    // Fully unbounded.
+    let got = db.scan(..).await.expect("scan");
+    assert_eq!(got.len(), 10);
+
+    // Snapshot::scan shares `scan_at`, so the same `Excluded` start must hold there too.
+    let snap = db.snapshot();
+    let got = snap
+        .scan((
+            Bound::Excluded(b"k03".to_vec()),
+            Bound::Excluded(b"k06".to_vec()),
+        ))
+        .expect("snapshot scan");
+    assert_eq!(keys(got), vec!["k04", "k05"]);
+}
+
+/// Oversized keys/values are rejected before they ever reach the writer thread, and the db
+/// stays fully usable afterward (the rejection doesn't poison anything).
+#[tokio::test]
+async fn oversized_key_and_value_are_rejected_and_db_stays_usable() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = Db::open_with(dir.path(), small_options())
+        .await
+        .expect("open");
+
+    let oversized_key = vec![b'k'; driftdb::wal::MAX_KEY_LEN + 1];
+    let err = db
+        .put(&oversized_key, b"v")
+        .await
+        .expect_err("oversized key must be rejected");
+    assert!(matches!(err, driftdb::Error::InvalidArgument(_)));
+
+    // A value this large would take a while to allocate/hash for no test value; a few bytes
+    // over the limit is enough to exercise the check.
+    let oversized_value = vec![b'v'; driftdb::wal::MAX_VALUE_LEN + 1];
+    let err = db
+        .put(b"k", &oversized_value)
+        .await
+        .expect_err("oversized value must be rejected");
+    assert!(matches!(err, driftdb::Error::InvalidArgument(_)));
+
+    // Neither rejection should have touched the engine -- ordinary ops still work, including an
+    // empty key/value (explicitly allowed).
+    db.put(b"", b"").await.expect("empty key/value put");
+    db.put(b"ok", b"still works").await.expect("put");
+    assert_eq!(db.get(b"").await.unwrap(), Some(Vec::new()));
+    assert_eq!(db.get(b"ok").await.unwrap(), Some(b"still works".to_vec()));
+}
+
+/// Regression test for the snapshot-registration race: `snapshot()`/`get()`/`scan()` used to
+/// read `visible_seq` *before* registering in the snapshot table, so a concurrent compaction's
+/// `oldest_snapshot()` could compute a floor newer than the seq a registering snapshot was about
+/// to use, and GC a version that snapshot still needed. Runs a writer hammering one key
+/// alongside a compactor while repeatedly registering snapshots, then checks after the fact that
+/// every observed `(seq, value)` matches what the write history says should have been visible at
+/// that exact seq -- any mismatch means a version was dropped out from under a live read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn snapshot_never_observes_a_version_gcd_by_a_racing_compaction() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut opts = small_options();
+    opts.memtable_size = 4 * 1024;
+    opts.l0_compaction_trigger = 2;
+    let db = Db::open_with(dir.path(), opts).await.expect("open");
+
+    let key = b"racer".to_vec();
+    let seed_seq = db
+        .write_batch(WriteBatch::new().put(key.clone(), b"v0".to_vec()))
+        .await
+        .expect("seed put");
+    let mut history = vec![(seed_seq, b"v0".to_vec())];
+
+    let writer_db = db.clone();
+    let writer_key = key.clone();
+    let writer = tokio::spawn(async move {
+        let mut h = Vec::new();
+        for i in 1..2_000u64 {
+            let v = format!("v{i}").into_bytes();
+            let seq = writer_db
+                .write_batch(WriteBatch::new().put(writer_key.clone(), v.clone()))
+                .await
+                .expect("put");
+            h.push((seq, v));
+        }
+        h
+    });
+
+    let compactor_db = db.clone();
+    let compactor = tokio::spawn(async move {
+        for _ in 0..30 {
+            let _ = compactor_db.compact().await;
+        }
+    });
+
+    let mut observed = Vec::new();
+    for _ in 0..3_000 {
+        let snap = db.snapshot();
+        let got = snap.get(&key).expect("snapshot get");
+        observed.push((snap.seq(), got));
+        tokio::task::yield_now().await;
+    }
+
+    let mut writer_history = writer.await.expect("writer join");
+    compactor.await.expect("compactor join");
+    history.append(&mut writer_history);
+
+    for (seq, got) in observed {
+        let expected = history
+            .iter()
+            .filter(|(s, _)| *s <= seq)
+            .max_by_key(|(s, _)| *s)
+            .map(|(_, v)| v.clone());
+        assert_eq!(
+            got, expected,
+            "snapshot registered at seq {seq} saw a version compaction had already GC'd"
+        );
+    }
 }
