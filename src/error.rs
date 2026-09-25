@@ -33,6 +33,13 @@ pub enum Error {
     /// magic/footer offsets, a block that failed its CRC check, or a malformed index/bloom.
     #[error("sst corrupt: {0}")]
     SstCorrupt(String),
+
+    /// A caller-supplied argument violates a documented limit — e.g. a key longer than
+    /// [`crate::wal::MAX_KEY_LEN`] or a value longer than [`crate::wal::MAX_VALUE_LEN`]. Checked
+    /// before the op ever reaches the writer thread, so the engine and any other pending writes
+    /// are unaffected.
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 /// Crate-wide `Result` alias.

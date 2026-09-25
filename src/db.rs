@@ -146,14 +146,7 @@ impl Snapshot {
 
 impl Drop for Snapshot {
     fn drop(&mut self) {
-        let mut m = self.inner.snapshots.lock();
-        if let Some(count) = m.get_mut(&self.seq) {
-            *count -= 1;
-            if *count == 0 {
-                m.remove(&self.seq);
-            }
-        }
-        self.inner.notify_all_waiters();
+        self.inner.unregister_snapshot(self.seq);
     }
 }
 
@@ -219,8 +212,16 @@ impl std::fmt::Debug for Inner {
     }
 }
 
+/// Error returned to a caller whose request can't reach the writer thread: normal shutdown (the
+/// sender was dropped by `Guard::shutdown_and_join`) or the writer thread having gone away
+/// unexpectedly (e.g. a panic, which drops its ack sender without replying). Both look the same
+/// from here -- the channel is just closed -- so the message says so plainly rather than
+/// guessing which one happened.
 fn closed_err() -> Error {
-    Error::Io(std::io::Error::other("driftdb: engine closed"))
+    Error::Io(std::io::Error::other(
+        "driftdb: engine closed (writer thread is no longer running -- either close()/Drop \
+         already ran, or the writer thread exited unexpectedly)",
+    ))
 }
 
 impl Inner {
@@ -240,15 +241,41 @@ impl Inner {
         Ok(())
     }
 
+    /// Register a new read view at the current `visible_seq` and return it. Registration and the
+    /// `visible_seq` read happen under the same `snapshots` lock that [`Inner::oldest_snapshot`]
+    /// uses, so a concurrent compaction can never observe a `visible_seq` that's newer than what
+    /// this call is about to register (which would let it GC a version this read still needs).
+    ///
+    /// ponytail: one mutex lock/unlock pair per registration is the whole cost of correctness
+    /// here; a lock-free epoch scheme would remove the mutex from the read path entirely if this
+    /// ever shows up in a profile.
+    fn register_snapshot(&self) -> u64 {
+        let mut snapshots = self.snapshots.lock();
+        let seq = self.visible_seq.load(Ordering::Acquire);
+        *snapshots.entry(seq).or_insert(0) += 1;
+        seq
+    }
+
+    /// Unregister a read view previously returned by [`Inner::register_snapshot`].
+    fn unregister_snapshot(&self, seq: u64) {
+        {
+            let mut snapshots = self.snapshots.lock();
+            if let Some(count) = snapshots.get_mut(&seq) {
+                *count -= 1;
+                if *count == 0 {
+                    snapshots.remove(&seq);
+                }
+            }
+        }
+        self.notify_all_waiters();
+    }
+
     fn oldest_snapshot(&self) -> u64 {
-        let floor = self
-            .snapshots
-            .lock()
-            .keys()
-            .next()
-            .copied()
-            .unwrap_or(u64::MAX);
-        floor.min(self.visible_seq.load(Ordering::Acquire))
+        let snapshots = self.snapshots.lock();
+        let floor = snapshots.keys().next().copied().unwrap_or(u64::MAX);
+        let visible = self.visible_seq.load(Ordering::Acquire);
+        drop(snapshots);
+        floor.min(visible)
     }
 
     fn alloc_file_number(&self) -> u64 {
@@ -311,7 +338,8 @@ impl Inner {
         seq: u64,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.check_fatal()?;
-        let start: Vec<u8> = match range.start_bound() {
+        let start_bound = range.start_bound().cloned();
+        let start: Vec<u8> = match &start_bound {
             Bound::Included(k) | Bound::Excluded(k) => k.clone(),
             Bound::Unbounded => Vec::new(),
         };
@@ -355,6 +383,13 @@ impl Inner {
         let mut out = Vec::new();
         for item in visible {
             let (k, v) = item?;
+            // `iter_from`/the SST readers seek to `start` inclusively, so an `Excluded` start
+            // bound needs its own filter here to drop the boundary key itself.
+            if let Bound::Excluded(s) = &start_bound {
+                if k.as_slice() == s.as_slice() {
+                    continue;
+                }
+            }
             let past_end = match &end_bound {
                 Bound::Included(e) => k.as_slice() > e.as_slice(),
                 Bound::Excluded(e) => k.as_slice() >= e.as_slice(),
@@ -545,8 +580,14 @@ fn as_option(v: Value) -> Option<Vec<u8>> {
 /// just-frozen memtable is tagged with, or `None` if the active memtable was empty. Only ever
 /// called from the writer thread.
 fn rotate(inner: &Inner, wal: &mut WalFile) -> Result<Option<u64>> {
-    if inner.mem.read().active.is_empty() {
-        return Ok(None);
+    {
+        let mem = inner.mem.read();
+        if mem.active.is_empty() {
+            // Nothing new to freeze, but a flush caller still needs to wait for whatever's
+            // already frozen. Flushes drain `immutables` oldest-first, so the newest entry's
+            // wal number is a valid wait target: once it's gone, every older one is too.
+            return Ok(mem.immutables.last().map(|(n, _)| *n));
+        }
     }
     loop {
         if inner.mem.read().immutables.len() < 2 {
@@ -671,6 +712,8 @@ fn writer_thread(inner: Arc<Inner>, rx: mpsc::Receiver<Req>, mut wal: WalFile) {
                         sync_failed = true;
                         let msg = format!("engine poisoned after fsync failure: {e}");
                         *inner.fatal.lock() = Some(msg.clone());
+                        inner.notify_all_waiters();
+                        inner.notify_bg();
                         for (ack, _) in acks {
                             fail_write(ack, &msg);
                         }
@@ -701,6 +744,8 @@ fn writer_thread(inner: Arc<Inner>, rx: mpsc::Receiver<Req>, mut wal: WalFile) {
                 Err(e) => {
                     let msg = e.to_string();
                     *inner.fatal.lock() = Some(msg.clone());
+                    inner.notify_all_waiters();
+                    inner.notify_bg();
                     for ack in rotates {
                         fail_rotate(ack, &msg);
                     }
@@ -749,9 +794,17 @@ fn bg_thread(inner: Arc<Inner>) {
         // Keep running past `shutdown` while a forced `compact()` is still in flight -- it
         // polls `pick_forced` on its own and would otherwise spin forever once this thread,
         // the only thing that can actually run a plan, stops picking up work.
+        //
+        // Once `fatal` is set, though, nothing here will ever make progress again (every flush
+        // and every compaction attempt bails out at the top of the inner loop), so `shutdown`
+        // must be able to tear this thread down immediately regardless of leftover `immutables`
+        // or an in-flight forced compaction -- otherwise a flush/fsync failure leaves a frozen
+        // memtable stuck forever and `Guard::shutdown_and_join` (close()/Drop) never returns.
+        let fatal = inner.fatal.lock().is_some();
         if inner.shutdown.load(Ordering::SeqCst)
-            && inner.mem.read().immutables.is_empty()
-            && !inner.force_compact.load(Ordering::SeqCst)
+            && (fatal
+                || (inner.mem.read().immutables.is_empty()
+                    && !inner.force_compact.load(Ordering::SeqCst)))
         {
             break;
         }
@@ -828,7 +881,30 @@ impl Db {
     }
 
     /// Durable, atomic write of one or more ops. Returns the seqno of the batch's last op.
+    ///
+    /// Every key/value is checked against [`wal::MAX_KEY_LEN`]/[`wal::MAX_VALUE_LEN`] before the
+    /// batch is sent to the writer thread; an oversized op fails the whole batch with
+    /// [`Error::InvalidArgument`] and nothing is written. Empty keys and empty values are
+    /// allowed.
     pub async fn write_batch(&self, batch: WriteBatch) -> Result<u64> {
+        for (key, val) in &batch.ops {
+            if key.len() > wal::MAX_KEY_LEN {
+                return Err(Error::InvalidArgument(format!(
+                    "key length {} exceeds MAX_KEY_LEN ({})",
+                    key.len(),
+                    wal::MAX_KEY_LEN
+                )));
+            }
+            if let Value::Put(v) = val {
+                if v.len() > wal::MAX_VALUE_LEN {
+                    return Err(Error::InvalidArgument(format!(
+                        "value length {} exceeds MAX_VALUE_LEN ({})",
+                        v.len(),
+                        wal::MAX_VALUE_LEN
+                    )));
+                }
+            }
+        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.send_req(Req::Write {
             batch: batch.ops,
@@ -849,24 +925,32 @@ impl Db {
         Ok(())
     }
 
-    /// Latest-version read.
+    /// Latest-version read. Registers a short-lived snapshot for the duration of the read so a
+    /// concurrent compaction can't drop the version this call is in the middle of reading (see
+    /// `Inner::register_snapshot`).
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let seq = self.guard.inner.visible_seq.load(Ordering::Acquire);
-        self.guard.inner.get_at(key, seq)
+        let inner = &self.guard.inner;
+        let seq = inner.register_snapshot();
+        let result = inner.get_at(key, seq);
+        inner.unregister_snapshot(seq);
+        result
     }
 
     /// Full range scan at the current seqno (see [`Snapshot::scan`] for a fixed-seqno version).
+    /// Same short-lived-snapshot protection as [`Db::get`].
     pub async fn scan<R: RangeBounds<Vec<u8>>>(&self, range: R) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let seq = self.guard.inner.visible_seq.load(Ordering::Acquire);
-        self.guard.inner.scan_at(range, seq)
+        let inner = &self.guard.inner;
+        let seq = inner.register_snapshot();
+        let result = inner.scan_at(range, seq);
+        inner.unregister_snapshot(seq);
+        result
     }
 
     /// Open a read snapshot at the current seqno. Compaction won't drop any version a live
     /// snapshot could still observe.
     pub fn snapshot(&self) -> Snapshot {
         let inner = self.guard.inner.clone();
-        let seq = inner.visible_seq.load(Ordering::Acquire);
-        *inner.snapshots.lock().entry(seq).or_insert(0) += 1;
+        let seq = inner.register_snapshot();
         Snapshot { inner, seq }
     }
 
@@ -1013,6 +1097,15 @@ fn open_sync(dir: &Path, options: Options) -> Result<Db> {
             },
             ManifestRecord::NextFileNumber(next_file_number),
         ])?;
+        for (_n, p) in &remaining {
+            let _ = std::fs::remove_file(p);
+        }
+    } else if !remaining.is_empty() {
+        // Every `remaining` WAL replayed to zero records -- either genuinely empty (no writes
+        // landed before the last close) or entirely torn (already truncated to nothing by
+        // `wal::replay`). There's nothing to flush, but leaving these files on disk means one
+        // extra empty `wal-*.log` piles up per open/close cycle forever, so clean them up here
+        // too instead of only in the "had data" branch above.
         for (_n, p) in &remaining {
             let _ = std::fs::remove_file(p);
         }
