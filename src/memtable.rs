@@ -39,11 +39,15 @@ impl Eq for InternalKey {}
 
 /// MVCC value variant — `Delete` is a tombstone the compactor eventually drops once it falls
 /// below the oldest live snapshot watermark.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
     Put(Vec<u8>),
     Delete,
 }
+
+/// One versioned record: `(user_key, seqno, value)`. Streams of entries are always ordered by
+/// `user_key ASC`, then `seqno DESC` (newest version of a key first).
+pub type Entry = (Vec<u8>, u64, Value);
 
 /// Concurrent memtable. `Db` holds one of these as the active write target plus a stack of
 /// frozen ones waiting on the flush thread.
