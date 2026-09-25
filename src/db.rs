@@ -118,7 +118,13 @@ impl Db {
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let seq = self.state.last_seq.load(Ordering::Acquire);
         // Phase 1: memtable-only path. Phase 2 falls through to frozen memtables + L0 + L1+.
-        Ok(self.active.get(key, seq))
+        Ok(self
+            .active
+            .get(key, seq)
+            .and_then(|v| match v {
+                Value::Put(v) => Some(v),
+                Value::Delete => None,
+            }))
     }
 
     /// Tombstone write. Same durability contract as `put`.
