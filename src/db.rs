@@ -82,7 +82,7 @@ impl Db {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
 
-        let manifest = Manifest::open(path)?;
+        let (manifest, _state) = Manifest::open(path)?;
 
         // Phase 1: a single fresh WAL file. Phase 2 enumerates + replays.
         let wal_path = path.join("wal-000001.log");
