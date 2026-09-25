@@ -1,26 +1,27 @@
 //! Top-level `Db` handle.
 //!
 //! Holds:
-//!   - a channel into the WAL writer task (group-commit fsync),
+//!   - the current WAL file (`wal.rs`'s `WalFile`),
 //!   - the active memtable + a stack of frozen memtables waiting on flush,
 //!   - the manifest log + per-level SST metadata,
 //!   - the snapshot watermark used to gate MVCC reads + tombstone GC.
 //!
-//! **Phase 1 status:** the memtable-only path (`put` → memtable, `get` → memtable) is wired
-//! so the quickstart example exercises real code. The WAL writer task is spawned, but flush /
-//! compaction / SST reads are stubbed out and surface as `todo!()` in their dedicated
-//! modules. This is the same shape the other P1–P4 scaffolds ship in.
+//! **Transitional status:** the memtable-only path (`put`/`delete` → WAL sync → memtable, `get`
+//! → memtable) is wired so the quickstart example exercises real code, but every write
+//! synchronously locks the WAL and fsyncs inline — no group commit, no WAL rotation, no replay
+//! on open. The dedicated writer thread + freeze/flush cycle described in
+//! `docs/plans/2026-09-25-driftdb-phase-2.md`'s "Durability model" lands with the full `db.rs`
+//! rewrite; flush / compaction / SST reads are stubbed out in their dedicated modules until then.
 
 use crate::compaction::CompactionState;
 use crate::manifest::Manifest;
 use crate::memtable::{Memtable, Value};
-use crate::wal::{WalMsg, WalWriter, DEFAULT_COMMIT_WINDOW_MS};
+use crate::wal::WalFile;
 use crate::Result;
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
 
 /// A point-in-time snapshot. Holds a seqno watermark — reads through the snapshot ignore
 /// records with `seqno > snap.seq`. While at least one snapshot is live, the compactor cannot
@@ -57,13 +58,14 @@ impl CompactionState for DbState {
 }
 
 /// The public handle. Cheap to clone — internally holds an `Arc` of the shared state plus the
-/// WAL sender.
+/// WAL file.
 #[derive(Debug, Clone)]
 pub struct Db {
     state: Arc<DbState>,
     active: Arc<Memtable>,
-    /// Send a record to the group-commit WAL writer.
-    wal_tx: mpsc::Sender<WalMsg>,
+    /// The current WAL file. `db.rs` gets a full group-commit rewrite in a later phase; for now
+    /// every write takes the lock and syncs synchronously.
+    wal: Arc<Mutex<WalFile>>,
 }
 
 impl Db {
@@ -84,18 +86,11 @@ impl Db {
 
         let manifest = Manifest::open(path)?;
 
-        // Phase 1: a single fresh WAL file. Phase 2 enumerates + replays.
-        let wal_path = path.join("wal-000001.log");
-        let wal_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&wal_path)?;
-        let writer = WalWriter::new(wal_file, 1);
-
-        let (wal_tx, wal_rx) = mpsc::channel::<WalMsg>(1024);
-        let commit_window = std::time::Duration::from_millis(DEFAULT_COMMIT_WINDOW_MS);
-        tokio::spawn(writer.run(wal_rx, commit_window));
+        // Phase 1/2-transition: always start a fresh WAL at generation 1 and skip replay. Real
+        // WAL-file enumeration, replay, and the group-commit writer thread land with the full
+        // `db.rs` rewrite (see `docs/plans/2026-09-25-driftdb-phase-2.md`); this is just enough
+        // to keep the crate compiling on the new `wal.rs` contract.
+        let wal = WalFile::create(path, 1)?;
 
         let state = Arc::new(DbState {
             levels: Mutex::new(Levels::default()),
@@ -110,70 +105,38 @@ impl Db {
         Ok(Self {
             state,
             active: Arc::new(Memtable::new()),
-            wal_tx,
+            wal: Arc::new(Mutex::new(wal)),
         })
     }
 
     /// Durable put. Returns once the record is in the WAL + memtable.
     pub async fn put(&self, key: &[u8], val: &[u8]) -> Result<()> {
-        let (ack_tx, ack_rx) = oneshot::channel();
-        self.wal_tx
-            .send(WalMsg::Write {
-                key: key.to_vec(),
-                val: val.to_vec(),
-                ack: ack_tx,
-            })
-            .await
-            .map_err(|_| {
-                crate::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "wal writer task gone",
-                ))
-            })?;
-        let seq = ack_rx.await.map_err(|_| {
-            crate::Error::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "wal writer dropped ack",
-            ))
-        })?;
-        self.state.last_seq.store(seq, Ordering::Release);
-        self.active
-            .insert(key.to_vec(), seq, Value::Put(val.to_vec()));
-        Ok(())
+        self.write(key, Value::Put(val.to_vec()))
     }
 
     /// Latest-version read. Equivalent to `self.snapshot().get(...)`.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let seq = self.state.last_seq.load(Ordering::Acquire);
         // Phase 1: memtable-only path. Phase 2 falls through to frozen memtables + L0 + L1+.
-        Ok(self.active.get(key, seq.max(u64::MAX / 2)))
+        Ok(self.active.get(key, seq))
     }
 
     /// Tombstone write. Same durability contract as `put`.
     pub async fn delete(&self, key: &[u8]) -> Result<()> {
-        // Mirrors put but with an empty value + a tombstone marker in the memtable.
-        let (ack_tx, ack_rx) = oneshot::channel();
-        self.wal_tx
-            .send(WalMsg::Write {
-                key: key.to_vec(),
-                val: Vec::new(),
-                ack: ack_tx,
-            })
-            .await
-            .map_err(|_| {
-                crate::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "wal writer task gone",
-                ))
-            })?;
-        let seq = ack_rx.await.map_err(|_| {
-            crate::Error::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "wal writer dropped ack",
-            ))
-        })?;
-        self.state.last_seq.store(seq, Ordering::Release);
-        self.active.insert(key.to_vec(), seq, Value::Delete);
+        self.write(key, Value::Delete)
+    }
+
+    /// Assign the next seqno, append + sync the WAL record, then apply it to the memtable.
+    /// Blocking (WAL sync is a syscall); the transitional single-writer path in `db.rs` doesn't
+    /// yet hand this off to a dedicated group-commit thread — see the `open` doc comment.
+    fn write(&self, key: &[u8], val: Value) -> Result<()> {
+        let seq = self.state.last_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        {
+            let mut wal = self.wal.lock();
+            wal.append(seq, key, &val);
+            wal.sync()?;
+        }
+        self.active.insert(key.to_vec(), seq, val);
         Ok(())
     }
 
