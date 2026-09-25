@@ -1,10 +1,6 @@
-//! Quickstart: open a fresh `Db` in a temp dir, put 1k keys, read them all back,
-//! assert equal, and print rough memtable stats.
-//!
-//! Phase 1: stays on the memtable-only path — `Db::get` only consults the active
-//! memtable in this build, so no SST flush is required to round-trip values.
-//! Once the flush thread + SST reader land in Phase 2, this example will still
-//! work; it just exercises a smaller fraction of the engine.
+//! Quickstart: open a fresh `Db` in a temp dir, put 1k keys, force a flush to L0,
+//! read them all back (now served from an SSTable, not the memtable), and print
+//! rough stats including the per-level file/byte counts.
 
 use driftdb::{Db, Result};
 use std::time::Instant;
@@ -30,7 +26,10 @@ async fn main() -> Result<()> {
     }
     let put_elapsed = put_start.elapsed();
 
-    println!("reading {N} keys back...");
+    println!("flushing to L0...");
+    db.flush().await?;
+
+    println!("reading {N} keys back (from SSTables)...");
     let get_start = Instant::now();
     for i in 0..N {
         let key = format!("key-{:06}", i);
@@ -44,12 +43,16 @@ async fn main() -> Result<()> {
     }
     let get_elapsed = get_start.elapsed();
 
+    let stats = db.stats();
     println!("stats:");
     println!("  puts:           {N}");
     println!("  put wall time:  {put_elapsed:?}");
     println!("  gets:           {N}");
     println!("  get wall time:  {get_elapsed:?}");
-    println!("  path:           memtable-only (SST flush lands in Phase 2)");
+    println!("  level files:    {:?}", stats.level_files);
+    println!("  level bytes:    {:?}", stats.level_bytes);
+    println!("  user bytes:     {}", stats.user_bytes_written);
+    println!("  disk bytes:     {}", stats.disk_bytes_written);
     println!("ok");
     Ok(())
 }
