@@ -87,8 +87,11 @@ impl PartialOrd for HeapEntry {
 struct Merge<'a> {
     sources: Vec<BoxIter<'a>>,
     heap: BinaryHeap<HeapEntry>,
-    /// An error already pulled from a source, waiting to be surfaced by the *next* call to
-    /// `next()` (the entry popped just before it was found is returned first).
+    /// An error already pulled from a source. Checked at the *start* of every `next()` call
+    /// (before popping anything else off the heap) and, if set, is yielded immediately and ends
+    /// the stream — see [`merge`]'s doc comment. The one exception is the entry that was popped
+    /// earlier in the *same* `next()` call that discovered the error: it's already been pulled
+    /// successfully and is returned before the error surfaces on the following call.
     pending_err: Option<Error>,
     done: bool,
 }
@@ -116,11 +119,14 @@ impl<'a> Merge<'a> {
     }
 
     /// Pull the next entry from `source` into the heap; stash an error rather than losing it.
+    /// Keeps only the *first* error seen — once one is pending, a second one from another
+    /// source during the same `next()` call (e.g. while resolving duplicates) is dropped rather
+    /// than overwriting it.
     fn pull(&mut self, source: usize) {
         match self.sources[source].next() {
             Some(Ok(entry)) => self.heap.push(HeapEntry { entry, source }),
-            Some(Err(e)) => self.pending_err = Some(e),
-            None => {}
+            Some(Err(e)) if self.pending_err.is_none() => self.pending_err = Some(e),
+            Some(Err(_)) | None => {}
         }
     }
 }
@@ -132,16 +138,16 @@ impl<'a> Iterator for Merge<'a> {
         if self.done {
             return None;
         }
-        let HeapEntry { entry, source } = match self.heap.pop() {
-            Some(e) => e,
-            None => {
-                if let Some(e) = self.pending_err.take() {
-                    self.done = true;
-                    return Some(Err(e));
-                }
-                return None;
-            }
-        };
+        // A source errored on a previous call (or during construction): surface it now and end
+        // the stream, before considering anything still sitting in the heap. Those entries were
+        // pulled from *other* sources and, without knowing the failed source's true position in
+        // merge order, aren't safe to assume come before it — so they're not yielded. See the
+        // struct doc comment.
+        if let Some(e) = self.pending_err.take() {
+            self.done = true;
+            return Some(Err(e));
+        }
+        let HeapEntry { entry, source } = self.heap.pop()?;
         self.pull(source);
         // Drop duplicate (key, seq) pairs from higher-indexed sources.
         while let Some(top) = self.heap.peek() {
@@ -416,14 +422,48 @@ mod tests {
 
     #[test]
     fn merge_error_propagates_then_ends() {
+        // `src_b`'s very first pull is the error, discovered during `Merge::new` before any
+        // entry has been returned — so per the "yield the error immediately, don't assume
+        // buffered entries precede it" contract, `src_a`'s entry is never yielded either: the
+        // stream just errors then ends.
         let good = vec![Ok(put("a", 1, "a1"))];
         let bad: Vec<Result<Entry>> = vec![Err(Error::WalCorrupt("boom".into()))];
         let src_a: BoxIter<'_> = Box::new(good.into_iter());
         let src_b: BoxIter<'_> = Box::new(bad.into_iter());
         let mut it = merge(vec![src_a, src_b]);
-        assert_eq!(it.next().unwrap().unwrap(), put("a", 1, "a1"));
         assert!(it.next().unwrap().is_err());
         assert!(it.next().is_none());
+    }
+
+    #[test]
+    fn merge_error_ends_stream_immediately_never_resurrects_later_source() {
+        // Source A errors right after yielding (a, 5); source B holds (b, 1) then (c, 1). A
+        // healthy source must not keep yielding past the point where another source failed —
+        // in the real read path B could hold a tombstone for a key A's failure hid, so letting
+        // B run to completion could resurrect a deleted key. The stream must yield at most the
+        // entries strictly before the failure, then the error, then end — and must never reach
+        // "c".
+        let a: Vec<Result<Entry>> =
+            vec![Ok(put("a", 5, "a5")), Err(Error::WalCorrupt("boom".into()))];
+        let b: Vec<Result<Entry>> = vec![Ok(put("b", 1, "b1")), Ok(put("c", 1, "c1"))];
+        let src_a: BoxIter<'_> = Box::new(a.into_iter());
+        let src_b: BoxIter<'_> = Box::new(b.into_iter());
+        let mut it = merge(vec![src_a, src_b]);
+
+        let mut yielded = Vec::new();
+        loop {
+            match it.next() {
+                Some(Ok(e)) => yielded.push(e),
+                Some(Err(_)) => break,
+                None => panic!("stream ended without ever surfacing the error"),
+            }
+        }
+        assert!(it.next().is_none(), "stream must end after the error");
+        assert!(
+            yielded.iter().all(|e| e.0 != b"c"[..]),
+            "must never yield the entry behind the failure: {yielded:?}"
+        );
+        assert!(yielded.iter().all(|e| e == &put("a", 5, "a5")) || yielded.is_empty());
     }
 
     fn model_visible(x: &[Entry], snapshot_seq: u64) -> BTreeMap<Vec<u8>, Vec<u8>> {

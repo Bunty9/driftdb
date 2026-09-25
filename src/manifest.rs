@@ -14,9 +14,14 @@
 //!   [u32 BE len][u32 BE crc32(payload)][bincode(Vec<ManifestRecord>) — `payload`, `len` bytes]
 //! ```
 //!
-//! A torn or CRC-mismatched frame is treated as the tail of a write that crashed mid-fsync and
-//! is silently dropped by replay (not an error); a CRC-valid frame that fails to bincode-decode
-//! is a real [`Error::ManifestCorrupt`], since the CRC proves the bytes are intact.
+//! A torn or CRC-mismatched frame is only ever the tail of a write that crashed mid-fsync when
+//! it really is the last thing in the file — then it's silently dropped by replay (not an
+//! error). The same goes for an all-zero `[len=0][crc=0]` frame, which is what a sparse,
+//! zero-filled extension after a crash looks like (`crc32(b"") == 0`). If either happens with
+//! more bytes still following it, that's not a torn tail — it's corruption in the middle of the
+//! log — and replay reports [`Error::ManifestCorrupt`] instead of silently dropping everything
+//! after it. A CRC-valid non-empty frame that fails to bincode-decode is always a real
+//! [`Error::ManifestCorrupt`], since the CRC proves the bytes are intact.
 //!
 //! ## Compaction on open
 //!
@@ -139,6 +144,11 @@ impl ManifestState {
 #[derive(Debug)]
 pub struct Manifest {
     file: File,
+    /// Set once an `append` fails partway through (write or sync). A failed write/sync can
+    /// leave a partial frame on disk that a later, successfully-acknowledged append would come
+    /// after — replay would never reach that later frame, so once poisoned every subsequent
+    /// `append` fails immediately too, same rationale as `WalFile`'s fsyncgate handling.
+    poisoned: bool,
 }
 
 impl Manifest {
@@ -153,14 +163,38 @@ impl Manifest {
         let tmp_path = dir.join(MANIFEST_TMP);
 
         let mut state = ManifestState::default();
-        if let Ok(bytes) = fs::read(&manifest_path) {
-            let mut offset = 0usize;
-            while let Some((edit, consumed)) = decode_frame(&bytes[offset..])? {
-                for rec in &edit {
-                    state.apply(rec);
+        match fs::read(&manifest_path) {
+            Ok(bytes) => {
+                let mut offset = 0usize;
+                loop {
+                    match decode_frame(&bytes[offset..])? {
+                        Frame::Complete(edit, consumed) => {
+                            for rec in &edit {
+                                state.apply(rec);
+                            }
+                            offset += consumed;
+                        }
+                        Frame::Torn => break,
+                        Frame::Suspect { frame_len } => {
+                            // Only a torn tail if nothing else follows it in the file; if more
+                            // bytes come after, this is corruption in the middle of the log.
+                            if offset + frame_len < bytes.len() {
+                                return Err(Error::ManifestCorrupt(format!(
+                                    "corrupt frame at offset {offset} ({} bytes follow it — not \
+                                     the tail)",
+                                    bytes.len() - offset - frame_len
+                                )));
+                            }
+                            break;
+                        }
+                    }
                 }
-                offset += consumed;
             }
+            // No manifest yet: fresh state. Any other read failure (permissions, I/O error,
+            // MANIFEST being a directory, ...) must propagate rather than silently starting
+            // from empty state and overwriting whatever's really there.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
         state.next_file_number = state.next_file_number.max(1);
 
@@ -178,14 +212,31 @@ impl Manifest {
         sync_dir(dir)?;
 
         let file = OpenOptions::new().append(true).open(&manifest_path)?;
-        Ok((Manifest { file }, state))
+        Ok((
+            Manifest {
+                file,
+                poisoned: false,
+            },
+            state,
+        ))
     }
 
     /// Append one edit (one frame) + `sync_data`. Returns once durable.
     pub fn append(&mut self, edit: &[ManifestRecord]) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::ManifestCorrupt(
+                "manifest poisoned: a previous append failed partway through".into(),
+            ));
+        }
         let frame = encode_edit(edit)?;
-        self.file.write_all(&frame)?;
-        self.file.sync_data()?;
+        if let Err(e) = self.file.write_all(&frame) {
+            self.poisoned = true;
+            return Err(e.into());
+        }
+        if let Err(e) = self.file.sync_data() {
+            self.poisoned = true;
+            return Err(e.into());
+        }
         Ok(())
     }
 }
@@ -201,27 +252,48 @@ pub fn encode_edit(edit: &[ManifestRecord]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Decode one frame from the front of `buf`. Returns `Ok(None)` for a torn frame (not enough
-/// bytes buffered yet) or a CRC mismatch — both are treated as "stop replaying here", since
-/// either can be the tail of a write that crashed mid-fsync. A CRC match with a bincode
-/// decode failure is a real corruption: the bytes proved intact, so a decode failure means the
-/// format itself is broken. Returns the decoded edit plus the number of bytes consumed.
-fn decode_frame(buf: &[u8]) -> Result<Option<(Vec<ManifestRecord>, usize)>> {
+/// Outcome of decoding one candidate frame from the front of a buffer. See module docs for the
+/// torn-tail-vs-corruption policy this feeds.
+enum Frame {
+    /// A complete, valid, non-empty frame: the decoded edit plus bytes consumed.
+    Complete(Vec<ManifestRecord>, usize),
+    /// Not enough bytes buffered for even a header, or for the header's declared payload —
+    /// unambiguously a torn tail, since there isn't enough data left in the file for anything
+    /// else to fit after it either.
+    Torn,
+    /// The header's declared length fits in what's buffered, but the frame is a zero-length
+    /// `[len=0][crc=0]` stand-in for a zero-filled tail, or its CRC didn't match. Ambiguous on
+    /// its own — a torn tail only if nothing else follows it in the file, which the caller
+    /// (which can see the rest of the buffer) decides. `frame_len` is `8 + len`.
+    Suspect { frame_len: usize },
+}
+
+/// Decode one frame from the front of `buf`. See [`Frame`] for the three outcomes.
+fn decode_frame(buf: &[u8]) -> Result<Frame> {
     if buf.len() < 8 {
-        return Ok(None);
+        return Ok(Frame::Torn);
     }
     let len = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
     let crc = u32::from_be_bytes(buf[4..8].try_into().unwrap());
     if buf.len() < 8 + len {
-        return Ok(None);
+        return Ok(Frame::Torn);
     }
-    let payload = &buf[8..8 + len];
+    let frame_len = 8 + len;
+    // A zero-length frame is indistinguishable from a genuine (if pointless) empty edit by CRC
+    // alone (crc32(b"") == 0), and is exactly what a sparse, zero-filled extension after a
+    // crash looks like — treat it the same as a CRC mismatch rather than trying to bincode
+    // decode it (that would fail anyway, since `Vec<ManifestRecord>` never serializes to zero
+    // bytes).
+    if len == 0 {
+        return Ok(Frame::Suspect { frame_len });
+    }
+    let payload = &buf[8..frame_len];
     if crc32fast::hash(payload) != crc {
-        return Ok(None);
+        return Ok(Frame::Suspect { frame_len });
     }
     let edit: Vec<ManifestRecord> = bincode::deserialize(payload)
         .map_err(|e| Error::ManifestCorrupt(format!("bad frame payload: {e}")))?;
-    Ok(Some((edit, 8 + len)))
+    Ok(Frame::Complete(edit, frame_len))
 }
 
 /// fsync a directory so a preceding create/rename/unlink within it is durable.
@@ -437,6 +509,89 @@ mod tests {
         let (_m2, state2) = Manifest::open(dir.path()).unwrap();
         assert_eq!(state2.last_flushed_wal, 0);
         assert_eq!(state2.last_seq, 0);
+    }
+
+    #[test]
+    fn non_not_found_read_error_propagates_instead_of_fresh_state() {
+        let dir = tempdir().unwrap();
+        // Create MANIFEST as a directory so `fs::read` fails with something other than
+        // NotFound. The old code swallowed *any* read error into "fresh state"; it must now
+        // propagate instead of silently proceeding as if there were no manifest at all.
+        fs::create_dir(dir.path().join("MANIFEST")).unwrap();
+        let err = Manifest::open(dir.path()).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn middle_frame_corruption_is_rejected_and_manifest_untouched() {
+        let dir = tempdir().unwrap();
+        let manifest_path = dir.path().join("MANIFEST");
+        let (mut m, _s) = Manifest::open(dir.path()).unwrap();
+        let frame0_len = fs::metadata(&manifest_path).unwrap().len();
+
+        // Two more frames after the initial snapshot: corrupting the first (middle) one must
+        // not be mistaken for a torn tail, since a real frame follows it.
+        m.append(&[ManifestRecord::SstAdded {
+            level: 0,
+            meta: meta(1),
+        }])
+        .unwrap();
+        m.append(&[ManifestRecord::WalFlushed {
+            number: 9,
+            last_seq: 9,
+        }])
+        .unwrap();
+        drop(m);
+
+        let mut bytes = fs::read(&manifest_path).unwrap();
+        let flip_at = frame0_len as usize + 8; // first payload byte of the middle frame
+        bytes[flip_at] ^= 0xFF;
+        fs::write(&manifest_path, &bytes).unwrap();
+
+        let before = fs::read(&manifest_path).unwrap();
+        let err = Manifest::open(dir.path()).unwrap_err();
+        assert!(matches!(err, Error::ManifestCorrupt(_)), "got {err:?}");
+        let after = fs::read(&manifest_path).unwrap();
+        assert_eq!(before, after, "a failed open must not rewrite MANIFEST");
+        assert!(!dir.path().join("MANIFEST.tmp").exists());
+    }
+
+    #[test]
+    fn zero_filled_tail_is_torn_and_open_succeeds_with_earlier_state() {
+        let dir = tempdir().unwrap();
+        let manifest_path = dir.path().join("MANIFEST");
+        let (mut m, _s) = Manifest::open(dir.path()).unwrap();
+        m.append(&[ManifestRecord::WalFlushed {
+            number: 7,
+            last_seq: 77,
+        }])
+        .unwrap();
+        drop(m);
+
+        // Simulate a crash that left a sparse, zero-filled extension after the last good frame:
+        // [len=0][crc=0], no payload. crc32(b"") == 0, so this can't be told apart from a real
+        // CRC mismatch by hash alone — it must be recognized by position (nothing follows it).
+        let mut bytes = fs::read(&manifest_path).unwrap();
+        bytes.extend_from_slice(&[0u8; 8]);
+        fs::write(&manifest_path, &bytes).unwrap();
+
+        let (_m2, state2) = Manifest::open(dir.path()).unwrap();
+        assert_eq!(state2.last_flushed_wal, 7);
+        assert_eq!(state2.last_seq, 77);
+    }
+
+    #[test]
+    fn poisoned_manifest_rejects_further_appends() {
+        let dir = tempdir().unwrap();
+        let (mut m, _s) = Manifest::open(dir.path()).unwrap();
+        m.poisoned = true; // simulate a prior append failing partway through.
+        let err = m
+            .append(&[ManifestRecord::WalFlushed {
+                number: 1,
+                last_seq: 1,
+            }])
+            .unwrap_err();
+        assert!(matches!(err, Error::ManifestCorrupt(_)), "got {err:?}");
     }
 
     #[test]

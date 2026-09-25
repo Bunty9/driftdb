@@ -13,12 +13,21 @@
 //!   +-----------------+
 //!   | bloom block     |   bincode: GrowableBloom
 //!   +-----------------+
-//!   | footer (24B)    |   [u64 BE index_off][u64 BE bloom_off][u64 BE magic=0xDEADBEEF]
+//!   | footer (32B)    |   [u64 BE index_off][u64 BE bloom_off][u32 BE crc32(index..bloom)]
+//!   |                 |   [u32 BE reserved=0][u64 BE magic=0xDEADBEEF]
 //!   +-----------------+
 //! ```
 //!
 //! Each data block entry: `[u32 BE klen][u32 BE vlen][u64 BE seq][u8 kind][key][val]`
 //! where `kind` is 1 for Put and 0 for Delete (the val bytes are absent for Delete).
+//!
+//! The footer's `crc32` covers every byte from `index_off` to the start of the footer — i.e.
+//! the index block and bloom block together — and is checked in `open` *before* either is
+//! bincode-deserialized. Without it, a bit flip in the index would silently skip blocks, and a
+//! bit flip in the bloom filter's bincode bytes would be handed straight to
+//! `growable-bloom-filter`'s deserializer, which is not guaranteed to fail cleanly on garbage
+//! input (it can panic or allocate wildly instead) — the checksum turns both into an ordinary
+//! `Error::SstCorrupt` instead.
 //!
 //! There is no block cache: every [`SstReader::get`] or iterator step decompresses its block
 //! fresh from the mmap.
@@ -42,8 +51,9 @@ pub const SSTABLE_MAGIC: u64 = 0xDEAD_BEEF;
 pub const BLOOM_FPR: f64 = 0.01;
 /// Bloom initial capacity hint — the filter grows past this if needed.
 pub const BLOOM_CAPACITY: usize = 100_000;
-/// Length of the fixed footer: `index_off (8) + bloom_off (8) + magic (8)`.
-const FOOTER_LEN: u64 = 24;
+/// Length of the fixed footer: `index_off (8) + bloom_off (8) + crc32 (4) + reserved (4) +
+/// magic (8)`.
+const FOOTER_LEN: u64 = 32;
 /// Length of one data-block header: `compressed_len (4) + crc32 (4)`.
 const BLOCK_HEADER_LEN: usize = 8;
 /// Length of one entry header inside a decompressed block: `klen(4) + vlen(4) + seq(8) + kind(1)`.
@@ -63,6 +73,18 @@ pub struct SstSummary {
 /// Path for SSTable number `number` inside `dir`: `dir/{number:06}.sst`.
 pub fn sst_path(dir: &Path, number: u64) -> PathBuf {
     dir.join(format!("{number:06}.sst"))
+}
+
+/// `Err(InvalidInput)` if `len` can't be represented in the 4-byte length prefix the on-disk
+/// entry header uses for a key or value — see [`SstWriter::add`].
+fn check_u32_len(len: usize, what: &str) -> std::io::Result<()> {
+    if len > u32::MAX as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("SstWriter::add: {what} length {len} exceeds u32::MAX"),
+        ));
+    }
+    Ok(())
 }
 
 /// Writer for a single SSTable file. Construct with [`SstWriter::new`], call [`SstWriter::add`]
@@ -103,7 +125,15 @@ impl<W: Write> SstWriter<W> {
 
     /// Append one record. Caller must feed records sorted by `(user_key ASC, seqno DESC)` so
     /// the index can record `(last_key, block_offset)` for each block.
+    ///
+    /// Errors (`InvalidInput`) rather than truncating if `key` or `val` is longer than
+    /// `u32::MAX` bytes — the on-disk entry header only has 4 bytes for each length, so silently
+    /// casting with `as u32` would wrap around and corrupt the entry instead of failing loudly.
     pub fn add(&mut self, key: &[u8], seqno: u64, val: &Value) -> std::io::Result<()> {
+        check_u32_len(key.len(), "key")?;
+        if let Value::Put(v) = val {
+            check_u32_len(v.len(), "value")?;
+        }
         if let Some(prev) = &self.prev_key {
             let cmp = key.cmp(prev.as_slice());
             debug_assert!(
@@ -192,8 +222,18 @@ impl<W: Write> SstWriter<W> {
         let bloom_bytes = bincode::serialize(&self.bloom)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         self.w.write_all(&bloom_bytes)?;
+
+        // CRC over the whole index+bloom region so `open` can catch a corrupt index or bloom
+        // before ever handing either to their (untrusted-input-unsafe) bincode deserializers.
+        let mut region_crc = crc32fast::Hasher::new();
+        region_crc.update(&index_bytes);
+        region_crc.update(&bloom_bytes);
+        let region_crc = region_crc.finalize();
+
         self.w.write_all(&index_off.to_be_bytes())?;
         self.w.write_all(&bloom_off.to_be_bytes())?;
+        self.w.write_all(&region_crc.to_be_bytes())?;
+        self.w.write_all(&0u32.to_be_bytes())?; // reserved
         self.w.write_all(&SSTABLE_MAGIC.to_be_bytes())?;
         self.w.flush()?;
 
@@ -262,7 +302,9 @@ impl SstReader {
         let footer = &mmap[footer_start as usize..];
         let index_off = u64::from_be_bytes(footer[0..8].try_into().unwrap());
         let bloom_off = u64::from_be_bytes(footer[8..16].try_into().unwrap());
-        let magic = u64::from_be_bytes(footer[16..24].try_into().unwrap());
+        let region_crc_expected = u32::from_be_bytes(footer[16..20].try_into().unwrap());
+        // footer[20..24] is reserved.
+        let magic = u64::from_be_bytes(footer[24..32].try_into().unwrap());
         if magic != SSTABLE_MAGIC {
             return Err(Error::SstCorrupt(format!(
                 "{}: bad magic {:#x}",
@@ -276,18 +318,29 @@ impl SstReader {
                 path.display()
             )));
         }
-        let index_bytes = mmap
-            .get(index_off as usize..bloom_off as usize)
+        // Verify the index+bloom region's checksum *before* handing either to bincode: a
+        // corrupt index would otherwise silently skip blocks, and a corrupt bloom filter could
+        // panic or hang inside `growable-bloom-filter`'s own deserializer instead of failing
+        // cleanly.
+        let region = mmap
+            .get(index_off as usize..footer_start as usize)
             .ok_or_else(|| {
-                Error::SstCorrupt(format!("{}: index region out of bounds", path.display()))
+                Error::SstCorrupt(format!(
+                    "{}: index/bloom region out of bounds",
+                    path.display()
+                ))
             })?;
+        let region_crc_actual = crc32fast::hash(region);
+        if region_crc_actual != region_crc_expected {
+            return Err(Error::SstCorrupt(format!(
+                "{}: index/bloom region crc mismatch (expected {region_crc_expected:#x}, got {region_crc_actual:#x})",
+                path.display()
+            )));
+        }
+        let index_bytes = &region[..(bloom_off - index_off) as usize];
         let index: Vec<(Vec<u8>, u64)> = bincode::deserialize(index_bytes)
             .map_err(|e| Error::SstCorrupt(format!("{}: bad index: {e}", path.display())))?;
-        let bloom_bytes = mmap
-            .get(bloom_off as usize..footer_start as usize)
-            .ok_or_else(|| {
-                Error::SstCorrupt(format!("{}: bloom region out of bounds", path.display()))
-            })?;
+        let bloom_bytes = &region[(bloom_off - index_off) as usize..];
         let bloom: GrowableBloom = bincode::deserialize(bloom_bytes)
             .map_err(|e| Error::SstCorrupt(format!("{}: bad bloom: {e}", path.display())))?;
 
@@ -305,7 +358,13 @@ impl SstReader {
     fn read_block(&self, offset: u64) -> crate::Result<Vec<Entry>> {
         let data = &self.mmap[..self.data_len as usize];
         let start = offset as usize;
-        let header = data.get(start..start + BLOCK_HEADER_LEN).ok_or_else(|| {
+        let header_end = start.checked_add(BLOCK_HEADER_LEN).ok_or_else(|| {
+            Error::SstCorrupt(format!(
+                "{}: block header offset overflow at offset {offset}",
+                self.path.display()
+            ))
+        })?;
+        let header = data.get(start..header_end).ok_or_else(|| {
             Error::SstCorrupt(format!(
                 "{}: block header out of bounds at offset {offset}",
                 self.path.display()
@@ -313,7 +372,7 @@ impl SstReader {
         })?;
         let clen = u32::from_be_bytes(header[0..4].try_into().unwrap()) as usize;
         let crc_expected = u32::from_be_bytes(header[4..8].try_into().unwrap());
-        let payload_start = start + BLOCK_HEADER_LEN;
+        let payload_start = header_end;
         let payload_end = payload_start.checked_add(clen).ok_or_else(|| {
             Error::SstCorrupt(format!(
                 "{}: block length overflow at offset {offset}",
@@ -343,32 +402,39 @@ impl SstReader {
     }
 
     fn parse_block(buf: &[u8], path: &Path) -> crate::Result<Vec<Entry>> {
+        let overflow =
+            |path: &Path| Error::SstCorrupt(format!("{}: entry offset overflow", path.display()));
         let mut out = Vec::new();
         let mut pos = 0usize;
         while pos < buf.len() {
-            let header = buf.get(pos..pos + ENTRY_HEADER_LEN).ok_or_else(|| {
+            let header_end = pos
+                .checked_add(ENTRY_HEADER_LEN)
+                .ok_or_else(|| overflow(path))?;
+            let header = buf.get(pos..header_end).ok_or_else(|| {
                 Error::SstCorrupt(format!("{}: truncated entry header", path.display()))
             })?;
             let klen = u32::from_be_bytes(header[0..4].try_into().unwrap()) as usize;
             let vlen = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
             let seq = u64::from_be_bytes(header[8..16].try_into().unwrap());
             let kind = header[16];
-            pos += ENTRY_HEADER_LEN;
+            pos = header_end;
 
+            let key_end = pos.checked_add(klen).ok_or_else(|| overflow(path))?;
             let key = buf
-                .get(pos..pos + klen)
+                .get(pos..key_end)
                 .ok_or_else(|| {
                     Error::SstCorrupt(format!("{}: truncated entry key", path.display()))
                 })?
                 .to_vec();
-            pos += klen;
+            pos = key_end;
 
             let val = match kind {
                 1 => {
-                    let v = buf.get(pos..pos + vlen).ok_or_else(|| {
+                    let val_end = pos.checked_add(vlen).ok_or_else(|| overflow(path))?;
+                    let v = buf.get(pos..val_end).ok_or_else(|| {
                         Error::SstCorrupt(format!("{}: truncated entry value", path.display()))
                     })?;
-                    pos += vlen;
+                    pos = val_end;
                     Value::Put(v.to_vec())
                 }
                 0 => Value::Delete,
@@ -591,6 +657,87 @@ mod tests {
             Some(Value::Put(b"v".to_vec()))
         );
         assert_eq!(reader.get(b"absent", 1).unwrap(), None);
+    }
+
+    #[test]
+    fn add_rejects_key_or_value_length_exceeding_u32_max() {
+        // `SstWriter::add` takes real slices, so the length check itself is exercised here
+        // through the same private helper it calls — driving it through `add` for real would
+        // require actually allocating a >4GiB buffer, which isn't a reasonable thing for a unit
+        // test to do.
+        assert!(check_u32_len(u32::MAX as usize, "key").is_ok());
+        let err = check_u32_len(u32::MAX as usize + 1, "key").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn corrupted_index_region_errors_without_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sst");
+        let entries: Vec<Entry> = (0..50u32)
+            .map(|i| {
+                (
+                    format!("k{i:04}").into_bytes(),
+                    1,
+                    Value::Put(vec![0u8; 64]),
+                )
+            })
+            .collect();
+        write_sst(&path, &entries);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let footer_start = bytes.len() - FOOTER_LEN as usize;
+        let index_off =
+            u64::from_be_bytes(bytes[footer_start..footer_start + 8].try_into().unwrap());
+        let bloom_off = u64::from_be_bytes(
+            bytes[footer_start + 8..footer_start + 16]
+                .try_into()
+                .unwrap(),
+        );
+        assert!(
+            bloom_off > index_off,
+            "index region must be non-empty for this test"
+        );
+        bytes[index_off as usize] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = SstReader::open(&path).unwrap_err();
+        assert!(matches!(err, Error::SstCorrupt(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn corrupted_bloom_region_errors_without_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sst");
+        let entries: Vec<Entry> = (0..50u32)
+            .map(|i| {
+                (
+                    format!("k{i:04}").into_bytes(),
+                    1,
+                    Value::Put(vec![0u8; 64]),
+                )
+            })
+            .collect();
+        write_sst(&path, &entries);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let footer_start = bytes.len() - FOOTER_LEN as usize;
+        let bloom_off = u64::from_be_bytes(
+            bytes[footer_start + 8..footer_start + 16]
+                .try_into()
+                .unwrap(),
+        );
+        assert!(
+            (footer_start as u64) > bloom_off,
+            "bloom region must be non-empty for this test"
+        );
+        bytes[bloom_off as usize] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Must fail cleanly with SstCorrupt, never panic/hang trying to deserialize a bogus
+        // bloom filter.
+        let err = SstReader::open(&path).unwrap_err();
+        assert!(matches!(err, Error::SstCorrupt(_)), "got {err:?}");
     }
 
     #[test]
