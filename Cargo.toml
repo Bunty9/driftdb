@@ -73,6 +73,10 @@ harness = false
 name = "ycsb"
 harness = false
 
+[[bench]]
+name = "report"
+harness = false
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
