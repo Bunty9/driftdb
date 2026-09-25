@@ -84,7 +84,7 @@ impl Db {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
 
-        let manifest = Manifest::open(path)?;
+        let (manifest, _state) = Manifest::open(path)?;
 
         // Phase 1/2-transition: always start a fresh WAL at generation 1 and skip replay. Real
         // WAL-file enumeration, replay, and the group-commit writer thread land with the full

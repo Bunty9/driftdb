@@ -158,6 +158,13 @@ pub enum ManifestRecord {
     SstAdded { level: u8, meta: SstMeta },
     SstDeleted { level: u8, number: u64 },
     WalFlushed { number: u64, last_seq: u64 },
+    /// Persists `next_file_number` across a manifest rewrite. Appended at the END of the enum
+    /// (bincode is position-indexed) so existing frames keep decoding. A file number can be
+    /// allocated and then deleted without ever appearing in a live `SstAdded` (e.g. a
+    /// compaction output later superseded), so `next_file_number` can't always be recovered
+    /// from the live SST set alone — the snapshot rewrite emits one of these to carry it
+    /// forward.
+    NextFileNumber(u64),
 }
 #[derive(Clone, Debug, Default)]
 pub struct ManifestState {
@@ -166,7 +173,13 @@ pub struct ManifestState {
     pub last_seq: u64,
     pub next_file_number: u64,       // > every sst number seen, >= 1
 }
-impl ManifestState { pub fn apply(&mut self, rec: &ManifestRecord); }
+impl ManifestState {
+    pub fn apply(&mut self, rec: &ManifestRecord);
+    /// One edit that, replayed from a fresh state, reproduces this state exactly: an
+    /// `SstAdded` for every live file, then `WalFlushed{last_flushed_wal, last_seq}` and
+    /// `NextFileNumber(next_file_number)`. Used by `Manifest::open` to compact the log.
+    pub fn snapshot_edit(&self) -> Vec<ManifestRecord>;
+}
 impl Manifest {
     /// Open/create dir/MANIFEST, replay, then rewrite it as a single snapshot
     /// edit (MANIFEST.tmp → fsync → rename → sync_dir) so it never grows unbounded.

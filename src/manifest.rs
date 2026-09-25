@@ -1,89 +1,491 @@
 //! Append-only manifest log.
 //!
-//! The manifest is the durable record of which SSTables belong to which level and which WAL
-//! file is currently active. On open the engine replays the manifest to rebuild the in-memory
-//! level metadata, then opens the current WAL and replays any records past the last flush.
+//! The manifest is the durable record of which SSTables belong to which level, which WAL file
+//! has been fully flushed, and the next free SST file number. On open the engine replays the
+//! manifest to rebuild [`ManifestState`], then opens the current WAL and replays any records
+//! past the last flush.
 //!
-//! Records are length-prefixed bincode-encoded `ManifestRecord` values:
+//! ## Framing
+//!
+//! Each edit (a batch of [`ManifestRecord`]s that must apply atomically, e.g. a compaction's
+//! adds + deletes) is written as one frame:
 //!
 //! ```text
-//!   [u32 BE len][bincode payload]
+//!   [u32 BE len][u32 BE crc32(payload)][bincode(Vec<ManifestRecord>) — `payload`, `len` bytes]
 //! ```
 //!
-//! Atomic update: writers append, then `fdatasync`. A successful append is what makes a
-//! compaction visible; crash before the append → the compactor output SST is orphaned and
-//! GC'd at next open.
+//! A torn or CRC-mismatched frame is treated as the tail of a write that crashed mid-fsync and
+//! is silently dropped by replay (not an error); a CRC-valid frame that fails to bincode-decode
+//! is a real [`Error::ManifestCorrupt`], since the CRC proves the bytes are intact.
+//!
+//! ## Compaction on open
+//!
+//! `Manifest::open` replays the log, then immediately rewrites `MANIFEST` as a single snapshot
+//! edit (`MANIFEST.tmp` → `sync_all` → rename → fsync the directory) so the log never grows
+//! unbounded with historical edits — only the live state plus enough bookkeeping
+//! ([`ManifestRecord::NextFileNumber`]) to resume file-number allocation.
+//!
+//! Atomic update: `append` writes one frame then `sync_data`s. A successful append is what
+//! makes a flush/compaction visible; a crash before the append leaves the new SST(s) orphaned,
+//! to be GC'd at next open.
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::Path;
 
-/// One entry in the manifest log. New variants must be appended (not reordered) — bincode is
-/// position-indexed for enums.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ManifestRecord {
-    /// A flush or compaction produced a new SSTable at `level`.
-    SstAdded { level: u8, path: PathBuf },
-    /// A compaction consumed an SSTable; reader handles holding the old file may finish their
-    /// in-flight reads before the file is unlinked from disk.
-    SstDeleted { level: u8, path: PathBuf },
-    /// WAL rotation. `seq` is the first seqno that will appear in the new file.
-    NewWal { path: PathBuf, seq: u64 },
+const MANIFEST_FILE: &str = "MANIFEST";
+const MANIFEST_TMP: &str = "MANIFEST.tmp";
+
+/// Metadata for one on-disk SSTable, as recorded in the manifest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SstMeta {
+    pub number: u64,
+    pub smallest: Vec<u8>,
+    pub largest: Vec<u8>,
+    pub size: u64,
+    pub max_seq: u64,
 }
 
-/// Append-only manifest log. Owns an open file handle for appends + a replayed snapshot of the
-/// log on construction.
+/// One entry in a manifest edit. New variants must be appended at the END (not reordered or
+/// inserted) — bincode is position-indexed for enums, and `MANIFEST` files already on disk
+/// depend on the existing ordinals.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ManifestRecord {
+    /// A flush or compaction produced a new SSTable at `level`.
+    SstAdded { level: u8, meta: SstMeta },
+    /// A compaction (or GC) removed SST `number` from `level`. No-op if absent.
+    SstDeleted { level: u8, number: u64 },
+    /// WAL `number` has been fully flushed to L0; `last_seq` is the max seqno it contained.
+    WalFlushed { number: u64, last_seq: u64 },
+    /// Persists the file-number allocator across a manifest rewrite. A file number can be
+    /// allocated and then deleted (e.g. a compaction output later superseded) without ever
+    /// appearing in a live `SstAdded`, so `next_file_number` can't always be recovered from the
+    /// live SST set alone — the snapshot rewrite emits one of these to carry it forward.
+    NextFileNumber(u64),
+}
+
+/// In-memory replay of the manifest log: the live SST set per level plus the durability/
+/// allocation counters recovery needs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManifestState {
+    /// `levels[0]` = L0, kept sorted by `number` ASC; `levels[n >= 1]` kept sorted by
+    /// `smallest` ASC.
+    pub levels: Vec<Vec<SstMeta>>,
+    pub last_flushed_wal: u64,
+    pub last_seq: u64,
+    /// Strictly greater than every SST number seen so far; always >= 1.
+    pub next_file_number: u64,
+}
+
+impl ManifestState {
+    /// Fold one manifest record into the state. See module docs for the framing this is fed
+    /// from; callers apply every record of an edit in order.
+    pub fn apply(&mut self, rec: &ManifestRecord) {
+        match rec {
+            ManifestRecord::SstAdded { level, meta } => {
+                let level = *level as usize;
+                if self.levels.len() <= level {
+                    self.levels.resize(level + 1, Vec::new());
+                }
+                self.levels[level].push(meta.clone());
+                if level == 0 {
+                    self.levels[level].sort_by_key(|m| m.number);
+                } else {
+                    self.levels[level].sort_by(|a, b| a.smallest.cmp(&b.smallest));
+                }
+                self.next_file_number = self.next_file_number.max(meta.number + 1).max(1);
+                self.last_seq = self.last_seq.max(meta.max_seq);
+            }
+            ManifestRecord::SstDeleted { level, number } => {
+                if let Some(files) = self.levels.get_mut(*level as usize) {
+                    files.retain(|m| m.number != *number);
+                }
+            }
+            ManifestRecord::WalFlushed { number, last_seq } => {
+                self.last_flushed_wal = self.last_flushed_wal.max(*number);
+                self.last_seq = self.last_seq.max(*last_seq);
+            }
+            ManifestRecord::NextFileNumber(n) => {
+                self.next_file_number = self.next_file_number.max(*n).max(1);
+            }
+        }
+    }
+
+    /// One edit that, replayed from a fresh (default) state, reproduces this state exactly:
+    /// an `SstAdded` for every live file, then a `WalFlushed` and a `NextFileNumber` carrying
+    /// the counters forward. Used to compact the on-disk log to a single snapshot frame.
+    pub fn snapshot_edit(&self) -> Vec<ManifestRecord> {
+        let mut edit = Vec::new();
+        for (level, files) in self.levels.iter().enumerate() {
+            for meta in files {
+                edit.push(ManifestRecord::SstAdded {
+                    level: level as u8,
+                    meta: meta.clone(),
+                });
+            }
+        }
+        edit.push(ManifestRecord::WalFlushed {
+            number: self.last_flushed_wal,
+            last_seq: self.last_seq,
+        });
+        edit.push(ManifestRecord::NextFileNumber(self.next_file_number));
+        edit
+    }
+}
+
+/// Append-only manifest log. Owns an open file handle positioned for appends.
 #[derive(Debug)]
 pub struct Manifest {
-    _dir: PathBuf,
-    // Populated in Phase 2:
-    //   file: std::fs::File,
-    //   records: Vec<ManifestRecord>,
+    file: File,
 }
 
 impl Manifest {
-    /// Open (or create) the manifest in `dir`. Replays the log to rebuild in-memory state.
-    pub fn open(dir: &Path) -> Result<Self> {
-        // Phase 2: open/create `dir/MANIFEST`, replay length-prefixed records, store handle.
-        std::fs::create_dir_all(dir)?;
-        Ok(Self {
-            _dir: dir.to_path_buf(),
-        })
+    /// Open (or create) `dir/MANIFEST`, replay it into a [`ManifestState`], then rewrite the
+    /// file as a single snapshot edit and reopen it for append. See module docs.
+    ///
+    /// A stale `MANIFEST.tmp` left by a crash mid-rewrite is never read — only overwritten by
+    /// the fresh rewrite below — so it's implicitly ignored.
+    pub fn open(dir: &Path) -> Result<(Manifest, ManifestState)> {
+        fs::create_dir_all(dir)?;
+        let manifest_path = dir.join(MANIFEST_FILE);
+        let tmp_path = dir.join(MANIFEST_TMP);
+
+        let mut state = ManifestState::default();
+        if let Ok(bytes) = fs::read(&manifest_path) {
+            let mut offset = 0usize;
+            while let Some((edit, consumed)) = decode_frame(&bytes[offset..])? {
+                for rec in &edit {
+                    state.apply(rec);
+                }
+                offset += consumed;
+            }
+        }
+        state.next_file_number = state.next_file_number.max(1);
+
+        let frame = encode_edit(&state.snapshot_edit())?;
+        {
+            let mut tmp = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            tmp.write_all(&frame)?;
+            tmp.sync_all()?;
+        }
+        fs::rename(&tmp_path, &manifest_path)?;
+        sync_dir(dir)?;
+
+        let file = OpenOptions::new().append(true).open(&manifest_path)?;
+        Ok((Manifest { file }, state))
     }
 
-    /// Append one record + fdatasync. Returns once the record is durable.
-    pub fn append(&mut self, _record: ManifestRecord) -> Result<()> {
-        // Phase 2: bincode::serialize → write [len][bytes] → fdatasync.
+    /// Append one edit (one frame) + `sync_data`. Returns once durable.
+    pub fn append(&mut self, edit: &[ManifestRecord]) -> Result<()> {
+        let frame = encode_edit(edit)?;
+        self.file.write_all(&frame)?;
+        self.file.sync_data()?;
         Ok(())
-    }
-
-    /// All records seen so far, in append order. Used by `Db::open` to rebuild level metadata
-    /// and discover orphaned SST files from a crashed compaction.
-    pub fn replay(&self) -> Vec<ManifestRecord> {
-        Vec::new()
     }
 }
 
-/// Serialize one record to bytes. Pulled out for testability + so the writer + replayer
-/// agree on the framing.
-pub fn encode(record: &ManifestRecord) -> Result<Vec<u8>> {
-    let payload = bincode::serialize(record)?;
-    let mut out = Vec::with_capacity(4 + payload.len());
+/// Encode one edit as `[u32 BE len][u32 BE crc32(payload)][payload]`.
+pub fn encode_edit(edit: &[ManifestRecord]) -> Result<Vec<u8>> {
+    let payload = bincode::serialize(edit)?;
+    let crc = crc32fast::hash(&payload);
+    let mut out = Vec::with_capacity(8 + payload.len());
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(&crc.to_be_bytes());
     out.extend_from_slice(&payload);
     Ok(out)
 }
 
-/// Deserialize one record from a `[u32 BE len][bytes]` framed slice. Returns the record + the
-/// number of bytes consumed.
-pub fn decode(buf: &[u8]) -> Result<(ManifestRecord, usize)> {
-    if buf.len() < 4 {
-        return Err(Error::ManifestCorrupt("truncated length prefix".into()));
+/// Decode one frame from the front of `buf`. Returns `Ok(None)` for a torn frame (not enough
+/// bytes buffered yet) or a CRC mismatch — both are treated as "stop replaying here", since
+/// either can be the tail of a write that crashed mid-fsync. A CRC match with a bincode
+/// decode failure is a real corruption: the bytes proved intact, so a decode failure means the
+/// format itself is broken. Returns the decoded edit plus the number of bytes consumed.
+fn decode_frame(buf: &[u8]) -> Result<Option<(Vec<ManifestRecord>, usize)>> {
+    if buf.len() < 8 {
+        return Ok(None);
     }
-    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    if buf.len() < 4 + len {
-        return Err(Error::ManifestCorrupt("truncated payload".into()));
+    let len = u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize;
+    let crc = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+    if buf.len() < 8 + len {
+        return Ok(None);
     }
-    let record: ManifestRecord = bincode::deserialize(&buf[4..4 + len])?;
-    Ok((record, 4 + len))
+    let payload = &buf[8..8 + len];
+    if crc32fast::hash(payload) != crc {
+        return Ok(None);
+    }
+    let edit: Vec<ManifestRecord> = bincode::deserialize(payload)
+        .map_err(|e| Error::ManifestCorrupt(format!("bad frame payload: {e}")))?;
+    Ok(Some((edit, 8 + len)))
+}
+
+/// fsync a directory so a preceding create/rename/unlink within it is durable.
+///
+/// ponytail: duplicated here rather than shared — `wal.rs` will grow the public version this
+/// delegates to once that module is rewritten; dedup then.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn meta(number: u64) -> SstMeta {
+        SstMeta {
+            number,
+            smallest: vec![number as u8],
+            largest: vec![number as u8],
+            size: 100,
+            max_seq: number,
+        }
+    }
+
+    #[test]
+    fn apply_orders_levels_and_updates_counters() {
+        let mut state = ManifestState::default();
+        state.apply(&ManifestRecord::SstAdded {
+            level: 0,
+            meta: meta(3),
+        });
+        state.apply(&ManifestRecord::SstAdded {
+            level: 0,
+            meta: meta(1),
+        });
+        state.apply(&ManifestRecord::SstAdded {
+            level: 0,
+            meta: meta(2),
+        });
+        assert_eq!(
+            state.levels[0].iter().map(|m| m.number).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        state.apply(&ManifestRecord::SstAdded {
+            level: 1,
+            meta: SstMeta {
+                number: 10,
+                smallest: b"m".to_vec(),
+                largest: b"z".to_vec(),
+                size: 1,
+                max_seq: 5,
+            },
+        });
+        state.apply(&ManifestRecord::SstAdded {
+            level: 1,
+            meta: SstMeta {
+                number: 11,
+                smallest: b"a".to_vec(),
+                largest: b"c".to_vec(),
+                size: 1,
+                max_seq: 6,
+            },
+        });
+        assert_eq!(
+            state.levels[1]
+                .iter()
+                .map(|m| m.smallest.clone())
+                .collect::<Vec<_>>(),
+            vec![b"a".to_vec(), b"m".to_vec()]
+        );
+
+        state.apply(&ManifestRecord::SstDeleted {
+            level: 0,
+            number: 2,
+        });
+        assert_eq!(
+            state.levels[0].iter().map(|m| m.number).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        // Deleting an absent number, and from a level with no files, is a no-op.
+        state.apply(&ManifestRecord::SstDeleted {
+            level: 0,
+            number: 999,
+        });
+        state.apply(&ManifestRecord::SstDeleted {
+            level: 6,
+            number: 1,
+        });
+        assert_eq!(state.levels[0].len(), 2);
+
+        assert_eq!(state.next_file_number, 12);
+        assert_eq!(state.last_seq, 6);
+
+        state.apply(&ManifestRecord::WalFlushed {
+            number: 4,
+            last_seq: 2,
+        });
+        assert_eq!(state.last_flushed_wal, 4);
+        assert_eq!(state.last_seq, 6); // max(6, 2) unchanged
+
+        state.apply(&ManifestRecord::NextFileNumber(50));
+        assert_eq!(state.next_file_number, 50);
+        state.apply(&ManifestRecord::NextFileNumber(3));
+        assert_eq!(state.next_file_number, 50); // max(50, 3) unchanged
+    }
+
+    #[test]
+    fn open_empty_dir_creates_manifest() {
+        let dir = tempdir().unwrap();
+        let (_m, state) = Manifest::open(dir.path()).unwrap();
+        assert!(dir.path().join("MANIFEST").exists());
+        assert_eq!(state.next_file_number, 1);
+        assert_eq!(state.last_seq, 0);
+        assert_eq!(state.last_flushed_wal, 0);
+        assert!(state.levels.is_empty());
+    }
+
+    #[test]
+    fn append_then_reopen_matches_state() {
+        let dir = tempdir().unwrap();
+        let (mut m, mut expected) = Manifest::open(dir.path()).unwrap();
+        let edits = vec![
+            vec![ManifestRecord::SstAdded {
+                level: 0,
+                meta: meta(1),
+            }],
+            vec![
+                ManifestRecord::SstAdded {
+                    level: 0,
+                    meta: meta(2),
+                },
+                ManifestRecord::WalFlushed {
+                    number: 1,
+                    last_seq: 20,
+                },
+            ],
+            vec![ManifestRecord::SstDeleted {
+                level: 0,
+                number: 1,
+            }],
+        ];
+        for edit in &edits {
+            m.append(edit).unwrap();
+            for rec in edit {
+                expected.apply(rec);
+            }
+        }
+        drop(m);
+
+        let (_m2, state2) = Manifest::open(dir.path()).unwrap();
+        assert_eq!(state2, expected);
+    }
+
+    #[test]
+    fn torn_last_frame_is_dropped_and_append_still_works() {
+        let dir = tempdir().unwrap();
+        let manifest_path = dir.path().join("MANIFEST");
+        let (mut m, _s) = Manifest::open(dir.path()).unwrap();
+        let base_len = fs::metadata(&manifest_path).unwrap().len();
+
+        m.append(&[ManifestRecord::SstAdded {
+            level: 0,
+            meta: meta(5),
+        }])
+        .unwrap();
+        drop(m);
+
+        let full = fs::read(&manifest_path).unwrap();
+        let appended_len = full.len() as u64 - base_len;
+        assert!(appended_len > 0);
+
+        for trunc in 1..=appended_len {
+            let keep = (full.len() as u64 - trunc) as usize;
+            fs::write(&manifest_path, &full[..keep]).unwrap();
+
+            let (mut m2, state2) = Manifest::open(dir.path()).unwrap();
+            // The torn append never took effect.
+            assert!(state2.levels.is_empty() || state2.levels[0].is_empty());
+
+            // Subsequent append + reopen still works.
+            m2.append(&[ManifestRecord::WalFlushed {
+                number: 1,
+                last_seq: 42,
+            }])
+            .unwrap();
+            drop(m2);
+
+            let (_m3, state3) = Manifest::open(dir.path()).unwrap();
+            assert_eq!(state3.last_flushed_wal, 1);
+            assert_eq!(state3.last_seq, 42);
+        }
+    }
+
+    #[test]
+    fn crc_mismatch_on_last_frame_is_dropped() {
+        let dir = tempdir().unwrap();
+        let manifest_path = dir.path().join("MANIFEST");
+        let (mut m, _s) = Manifest::open(dir.path()).unwrap();
+        m.append(&[ManifestRecord::WalFlushed {
+            number: 3,
+            last_seq: 99,
+        }])
+        .unwrap();
+        drop(m);
+
+        let mut bytes = fs::read(&manifest_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF; // corrupt a payload byte of the last frame
+        fs::write(&manifest_path, &bytes).unwrap();
+
+        let (_m2, state2) = Manifest::open(dir.path()).unwrap();
+        assert_eq!(state2.last_flushed_wal, 0);
+        assert_eq!(state2.last_seq, 0);
+    }
+
+    #[test]
+    fn counters_survive_multiple_reopens() {
+        let dir = tempdir().unwrap();
+        let (mut m, _s) = Manifest::open(dir.path()).unwrap();
+        m.append(&[
+            ManifestRecord::SstAdded {
+                level: 0,
+                meta: meta(7),
+            },
+            ManifestRecord::WalFlushed {
+                number: 2,
+                last_seq: 99,
+            },
+        ])
+        .unwrap();
+        drop(m);
+
+        for _ in 0..3 {
+            let (m2, state2) = Manifest::open(dir.path()).unwrap();
+            assert_eq!(state2.next_file_number, 8);
+            assert_eq!(state2.last_seq, 99);
+            assert_eq!(state2.last_flushed_wal, 2);
+            drop(m2);
+        }
+    }
+
+    #[test]
+    fn stale_tmp_file_is_ignored_and_overwritten() {
+        let dir = tempdir().unwrap();
+        let (mut m, _s) = Manifest::open(dir.path()).unwrap();
+        m.append(&[ManifestRecord::WalFlushed {
+            number: 1,
+            last_seq: 5,
+        }])
+        .unwrap();
+        drop(m);
+
+        fs::write(
+            dir.path().join("MANIFEST.tmp"),
+            b"garbage-from-a-crashed-rewrite",
+        )
+        .unwrap();
+
+        let (_m2, state2) = Manifest::open(dir.path()).unwrap();
+        assert_eq!(state2.last_flushed_wal, 1);
+        assert_eq!(state2.last_seq, 5);
+        // The rewrite overwrote + renamed the tmp file away; no stray garbage left behind.
+        assert!(!dir.path().join("MANIFEST.tmp").exists());
+    }
 }
