@@ -24,16 +24,12 @@ jobs:
           toolchain: ${{ matrix.rust }}
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Install nextest
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
-      - name: cargo nextest
-        run: cargo nextest run --no-fail-fast
+      - name: cargo test
+        run: cargo test --lib --bin --test '*' -- --test-threads=1
 
   deny:
     name: cargo-deny

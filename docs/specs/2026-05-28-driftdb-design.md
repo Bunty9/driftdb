@@ -9,6 +9,12 @@ related:
 
 # driftdb — Design Spec
 
+> **Note (Phase 2):** The implementation has superseded several details in this spec.
+> For the authoritative module contracts and byte layouts, see
+> [`docs/plans/2026-09-25-driftdb-phase-2.md`](../plans/2026-09-25-driftdb-phase-2.md)
+> and read the source files directly (`src/wal.rs`, `src/sstable.rs`, `src/manifest.rs`).
+> This spec remains useful for understanding the high-level architecture and design rationale.
+
 > Companion spec lifted from `projects-l3-l4.md` § "P5 — LSM-tree KV
 > engine with WAL + MVCC (driftdb)". Code blocks are the authoritative
 > implementation reference for the scaffold; downstream phases extend,

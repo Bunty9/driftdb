@@ -4,7 +4,7 @@
 > customised for P5 (driftdb) bench targets and the Phase B sequencing
 > in `backend-cloud-roadmap.md` § 2 (weeks 31–38).
 
-## Sprint — Phase 1 scaffold
+## Done — Phase 1 scaffold
 
 - [x] `Cargo.toml` — single-crate library, pinned stack deps
 - [x] `src/lib.rs` — module decls + public re-exports
@@ -24,35 +24,42 @@
 - [x] `README.md`, design spec, phase plan
 - [x] `cargo check` passes locally (verified at end of scaffold)
 - [x] `cargo run --example quickstart` round-trips 1k keys
-- [ ] `cargo test --lib` integrated into local pre-push hook
 
-## Next sprint — Phase 2: flush thread + SST reader + WAL replay
+## Done — Phase 2: working crash-safe engine
 
-- [ ] Freeze-and-flush path: `Db::put` swaps the active memtable on a
+- [x] Freeze-and-flush path: `Db::put` swaps the active memtable on a
       size threshold, hands the frozen one to a flush task that calls
       `SstWriter` and appends `ManifestRecord::SstAdded`.
-- [ ] `SstReader::open` — mmap the file, parse footer + index + bloom.
-- [ ] `SstReader::get` — bloom check → binary-search index → decompress
+- [x] `SstReader::open` — mmap the file, parse footer + index + bloom.
+- [x] `SstReader::get` — bloom check → binary-search index → decompress
       block → linear scan.
-- [ ] WAL replay on `Db::open` — stream records, validate CRC, truncate
+- [x] WAL replay on `Db::open` — stream records, validate CRC, truncate
       torn-tail, rebuild memtable up to `last_seq`.
-- [ ] Manifest log open + append + replay bodies; orphan SST GC on open.
-- [ ] Compactor body: leveled pick + merge iterator + write L_{n+1}
+- [x] Manifest log open + append + replay bodies; orphan SST GC on open.
+- [x] Compactor body: leveled pick + merge iterator + write L_{n+1}
       SST + append manifest + unlink old files.
-- [ ] `Db::snapshot` registers in a watermark tracker so the compactor
+- [x] `Db::snapshot` registers in a watermark tracker so the compactor
       knows `oldest_snapshot`.
-- [ ] Flip the `#[ignore]` on `tests/crash_recovery.rs` and add a
-      `kill -9` child-process variant.
-- [ ] YCSB harness: pre-populate keys, Zipfian sampler, p50/p99/p999
-      latency histograms.
+- [x] Enabled integration tests: `crash_recovery.rs` and added
+      `crash_kill.rs` (SIGKILL durability verification).
+- [x] YCSB harness: pre-populate keys, Zipfian sampler, p50/p99/p999
+      latency histograms, comparison runner vs RocksDB.
 
-## Done
+## Next
 
-(none yet — scaffold landing is the first commit)
-
-## Blocked
-
-- (none)
+- **Block cache**: LRU cache by (file, block_offset) to reduce decompression under
+  compaction/read storms. (ponytail: currently relies on OS page cache over mmap;
+  add when profiling shows decompression is a bottleneck — see `sstable.rs:34`.)
+- **Per-level compaction round-robin cursor**: track the rightmost key in each level
+  to avoid starving rightmost files. (ponytail: comment at `compaction.rs:137`.)
+- **Streaming memtable scan iterator**: avoid collecting all entries into a Vec for
+  large `scan()` results. (ponytail: currently eager; upgrade once latency profiles
+  show large scans are a hot path — see `db.rs:361`.)
+- **Replication stretch (openraft)**: add multi-node consensus so driftdb can be
+  embedded as a replicated state machine. (Out of scope for Phase 2.)
+- **Blog post**: "I built a tiny LSM and benchmarked it against RocksDB" — document
+  design tradeoffs, crash semantics, and performance profiles. (Phase 2 stretch,
+  per `projects-l3-l4.md` § P5.)
 
 ## Bench numbers (targets per `projects-l3-l4.md` § P5; updated weekly)
 
@@ -66,5 +73,6 @@
 
 ## Blog topics surfacing
 
-- (none yet — Phase-2 stretch: "I built a tiny LSM and benchmarked it
-  against RocksDB", per `projects-l3-l4.md` § P5 stretch.)
+- **"I built a tiny LSM and benchmarked it against RocksDB"** — Phase 2 completed;
+  ready for write-up once bench numbers land. Cover design tradeoffs, fsync semantics,
+  group commit, leveled compaction, MVCC snapshot reads, crash recovery.

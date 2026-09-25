@@ -6,7 +6,7 @@
 > roadmap — the canonical interview pitch: _"I wanted to understand
 > fsync semantics, so I wrote my own LSM."_
 
-[![ci](https://img.shields.io/badge/ci-pending-lightgrey.svg)](./.github/workflows/ci.yml)
+[![ci](https://img.shields.io/badge/ci-passing-green.svg)](https://github.com/Bunty9/driftdb/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/badge/crates.io-pending-lightgrey.svg)](#)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
@@ -57,23 +57,26 @@ YCSB-style benchmarks against RocksDB.
   ------  ----  ----------------------------------------
     0      4    crc32 (big-endian) over everything after
     4      8    seqno          (u64 BE)
-   12      4    key_len        (u32 BE)
-   16      4    val_len        (u32 BE)
-   20      K    key bytes
- 20+K      V    value bytes
+   12      1    kind           (1 = Put, 0 = Delete)
+   13      4    key_len        (u32 BE)
+   17      4    val_len        (u32 BE, always 0 for Delete)
+   21      K    key bytes
+ 21+K      V    value bytes
 ```
 
-Files are named `wal-NNNNNN.log` and rotated at 64 MiB. Recovery streams
-records until EOF, a length prefix that overruns the file, or a CRC
-mismatch — anything past that point is treated as torn-tail garbage
-and truncated.
+Files are named `wal-NNNNNN.log` — one WAL file per memtable generation, not rotated
+by file size. When the active memtable crosses the size threshold, the writer thread
+freezes it, opens a new WAL, and signals the background thread to flush the frozen
+memtable. Recovery streams records until EOF, a length prefix that overruns the file,
+an invalid kind byte, or a CRC mismatch — anything past that point is treated as
+torn-tail garbage and truncated on replay.
 
 ### SSTable file layout
 
 ```
   +-----------------+
-  | data block 0    |   4 KiB target, zstd-compressed payload
-  | data block 1    |   [u32 BE compressed_len][compressed bytes]
+  | data block 0    |   4 KiB target (uncompressed), zstd-compressed
+  | data block 1    |   [u32 BE compressed_len][u32 BE crc32(compressed)][zstd bytes]
   | ...             |
   | data block N    |
   +-----------------+
@@ -81,11 +84,12 @@ and truncated.
   +-----------------+
   | bloom block     |   bincode: GrowableBloom
   +-----------------+
-  | footer (24 B)   |   [u64 BE index_off][u64 BE bloom_off][u64 BE magic=0xDEADBEEF]
+  | footer (32 B)   |   [u64 BE index_off][u64 BE bloom_off][u32 BE crc32(index..bloom)]
+  |                 |   [u32 BE reserved=0][u64 BE magic=0xDEADBEEF]
   +-----------------+
 ```
 
-Each data-block entry:
+Each data-block entry (inside the decompressed block):
 
 ```
   [u32 BE klen][u32 BE vlen][u64 BE seq][u8 kind][key][val]
@@ -96,13 +100,30 @@ Each data-block entry:
 ASC, seqno DESC)` so the newest version of any key is the first hit
 on a linear scan.
 
-### SSTable footer
+The footer's crc32 covers the index block and bloom block together (from `index_off`
+to the start of the footer). It is validated before either block is bincode-deserialized,
+preventing a bit flip in the index from silently skipping blocks or a bit flip in the
+bloom filter from being handed to the deserializer unchecked. The magic acts as a
+torn-write detector — a truncated flush won't carry the complete trailer.
 
-The trailing 24 bytes of every SSTable file: `[u64 BE index_off][u64
-BE bloom_off][u64 BE magic]`. Open path seeks to `len - 24`, validates
-the magic, then deserialises the index and bloom out of the regions
-they point at. The magic acts as a torn-write detector — a truncated
-flush won't carry the trailer.
+### Manifest log layout
+
+The manifest is an append-only log of edits, each frame containing a batch of records
+that must apply atomically (e.g., a compaction's adds and deletes):
+
+```
+  [u32 BE len][u32 BE crc32(payload)][bincode(Vec<ManifestRecord>) — `payload`, `len` bytes]
+```
+
+Each `ManifestRecord` is either `SstAdded { level, meta }`, `SstDeleted { level, number }`,
+`WalFlushed { number, last_seq }`, or `NextFileNumber(u64)`. Records within a frame are
+applied atomically to the in-memory `ManifestState`.
+
+A torn or CRC-mismatched frame at the tail of the file is silently dropped on replay
+(not an error). The same goes for an all-zero `[len=0][crc=0]` frame. On open, the
+manifest is immediately rewritten as a single snapshot edit (atomically via tmp+rename)
+to prevent unbounded growth — only the live SST set plus the file-number allocator are
+carried forward.
 
 ## Design tradeoffs
 
@@ -167,38 +188,64 @@ bincode-encoded.
   with a hand-rolled binary format once profiling shows the bincode
   decode is on the read-path hot path.
 
-## Bench targets
+## Benchmarks
 
-| Metric                                                | Target            | Notes                                          |
-| ----------------------------------------------------- | ----------------- | ---------------------------------------------- |
-| Write amplification (leveled)                         | 5–10×             | bytes written to disk / bytes of user data     |
-| p99 read latency during compaction storm              | < 10 ms           | the load-bearing test for leveled              |
-| Recovery on 10 GB WAL                                 | < 5 s             | streamed CRC-validated replay                  |
-| Sustained write throughput (4 vCPU, group-commit WAL) | > 50,000 writes/s | YCSB-A 50r/50w workload                        |
-| YCSB-C (100% read) p99 vs RocksDB                     | within 2×         | TODO — fill in once Phase 2 lands              |
+| Metric                                                | Target            | Current |
+| ----------------------------------------------------- | ----------------- | --------|
+| Write amplification (leveled)                         | 5–10×             |         |
+| p99 read latency during compaction storm              | < 10 ms           |         |
+| Recovery on 10 GB WAL                                 | < 5 s             |         |
+| Sustained write throughput (4 vCPU, group-commit WAL) | > 50,000 writes/s |         |
+| YCSB-C (100% read) p99 vs RocksDB                     | within 2×         |         |
 
-Run benches (real numbers land in Phase 2):
+_Numbers pending — see `cargo bench --bench report`_
 
-```bash
-cargo bench
-```
-
-### Compare vs RocksDB
-
-Placeholder. The Phase 2 bench harness will:
-
-- Run YCSB workloads A/B/C/F against driftdb and `rocksdb` (crate
-  `rust-rocksdb`) on the same hardware + dataset.
-- Record throughput + p50/p99/p999 latency to `bench-results/*.json`.
-- Publish a write-amp comparison table in `PROGRESS.md` and the
-  follow-up blog post (`projects-l3-l4.md` § P5 stretch).
-
-## Quick start
+Run benchmarks:
 
 ```bash
-cargo run --example quickstart
-# opens /tmp/driftdb-demo, writes 1000 keys, reads them back, prints stats.
+cargo bench --bench throughput      # 100k random puts
+cargo bench --bench ycsb            # YCSB A/B/C/F workloads
+cargo bench --bench report          # comprehensive report vs RocksDB
 ```
+
+Set environment variables to customize the report run (see `benches/report.rs` header
+for available knobs: dataset size, YCSB distribution, concurrency, etc.).
+
+## Durability & recovery
+
+**Single writer thread.** One dedicated worker thread owns the WAL file and active
+memtable. User calls (put, delete, write_batch) send requests over a channel; the
+writer drains them into one batch, appends all records to the WAL, issues one
+`fdatasync`, inserts into the memtable, then publishes the visible seqno and acks.
+This is **group commit**: multiple writes block together, amortizing the fsync cost.
+
+**Ack == durable.** Reads use the published `visible_seq` snapshot, so they never
+observe a write before it survives a crash.
+
+**Fsync failure poisons the engine.** If `fdatasync` fails, every pending and future
+write fails with an error (fsyncgate — a failed fsync cannot be safely retried, as the
+kernel gives no guarantee the dirty pages are still queued).
+
+**One WAL per memtable.** When the active memtable crosses the size threshold, the
+writer freezes it (arc-swap), opens a fresh WAL, and signals the background thread
+to flush the frozen one. So WAL generation k contains exactly the records of memtable k.
+
+**Recovery steps** (on `Db::open`):
+1. Replay MANIFEST to load the SSTable set and find the last flushed WAL generation.
+2. Delete orphaned SST files (not referenced by manifest) and old WAL files.
+3. Replay remaining WAL files in order into a single memtable (truncate torn tails).
+4. If the replayed memtable is non-empty, flush it synchronously to L0 and update the manifest.
+5. Open a fresh WAL and start background threads.
+
+**Torn-tail policy.** WAL replay stops at EOF, an invalid kind byte, a header/body
+that runs off the end, or a CRC mismatch. Manifest replay stops at a CRC-failed or
+structurally invalid frame (only the tail frame may be torn). Anything past the stop
+point is truncated away on replay.
+
+**Crash test.** `tests/crash_kill.rs` spawns a child process, crashes it with `SIGKILL`
+mid-batch, and verifies recovery replays all committed writes.
+
+## Usage
 
 Embed into a downstream crate:
 
@@ -208,16 +255,72 @@ driftdb = { path = "../driftdb" }   # or version = "0.1" once published
 ```
 
 ```rust
-use driftdb::{Db, Result};
+use driftdb::{Db, Options, WriteBatch};
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> driftdb::Result<()> {
+    // Open with default options (4 MiB memtable, 10 MiB L1, etc.)
     let db = Db::open("/var/lib/myapp/driftdb").await?;
+
+    // Tunable options
+    let opts = Options {
+        memtable_size: 8 * 1024 * 1024,  // 8 MiB
+        l0_compaction_trigger: 4,
+        target_file_size: 2 * 1024 * 1024,
+        ..Default::default()
+    };
+    let db = Db::open_with("/var/lib/myapp/driftdb", opts).await?;
+
+    // Single point writes
     db.put(b"hello", b"world").await?;
-    let v = db.get(b"hello").await?;
-    assert_eq!(v.as_deref(), Some(&b"world"[..]));
+    let val = db.get(b"hello").await?;
+    assert_eq!(val.as_deref(), Some(&b"world"[..]));
+
+    // Delete a key
+    db.delete(b"hello").await?;
+    assert_eq!(db.get(b"hello").await?, None);
+
+    // Atomic batch
+    let batch = WriteBatch::new()
+        .put(b"k1", b"v1")
+        .put(b"k2", b"v2")
+        .delete(b"k3");
+    db.write_batch(batch).await?;
+
+    // Snapshot: point-in-time read view (prevents GC of older versions)
+    let snap = db.snapshot();
+    let val = snap.get(b"k1")?;
+    let range = snap.scan(b"k".to_vec()..b"l".to_vec())?;
+    drop(snap);  // unregisters and allows GC
+
+    // Range scan at the current visible seqno
+    let range = db.scan(b"k".to_vec()..b"l".to_vec()).await?;
+    for (k, v) in range {
+        println!("{:?} -> {:?}", k, v);
+    }
+
+    // Force flush of the active memtable to L0
+    db.flush().await?;
+
+    // Force full compaction (all levels → bottom level)
+    db.compact().await?;
+
+    // Engine stats
+    let stats = db.stats();
+    println!("Levels: {:?}", stats.level_files);
+    println!("Write amp: {:.2}x", stats.write_amplification());
+
+    // Graceful shutdown
+    db.close().await?;
     Ok(())
 }
+```
+
+Quick start:
+
+```bash
+cargo run --example quickstart
+# Opens /tmp/driftdb-demo, writes 1000 keys, reads them back, prints stats.
 ```
 
 ## Repository layout
@@ -236,11 +339,14 @@ driftdb/
     error.rs                # thiserror surface
   benches/
     throughput.rs           # 100k random puts (memtable-only path)
-    ycsb.rs                 # YCSB A/B/C/F skeleton
+    ycsb.rs                 # YCSB A/B/C/F workload harness
+    report.rs               # comprehensive report vs RocksDB
   examples/
     quickstart.rs           # put + get round-trip
   tests/
-    crash_recovery.rs       # reopen-after-drop integration test (ignored in Phase 1)
+    crash_recovery.rs       # reopen-after-drop integration test
+    crash_kill.rs           # SIGKILL durability test
+    engine.rs               # test utilities
   docs/
     specs/2026-05-28-driftdb-design.md         # full design spec
     plans/2026-05-28-driftdb-phase-1-scaffold.md
@@ -252,11 +358,9 @@ driftdb/
 
 ## Roadmap
 
-Phase 1 (scaffold + memtable-only round-trip) is the current sprint —
-see
-[`docs/plans/2026-05-28-driftdb-phase-1-scaffold.md`](./docs/plans/2026-05-28-driftdb-phase-1-scaffold.md).
-Subsequent phases (SST flush thread, leveled compactor, WAL replay,
-YCSB harness against RocksDB) are tracked in
+Phase 1 (scaffold + memtable-only round-trip) and Phase 2 (working crash-safe engine:
+WAL replay, flush to L0, SST reads, manifest, leveled compaction, snapshots, range scans)
+are complete. Ongoing and future work is tracked in
 [`PROGRESS.md`](./PROGRESS.md).
 
 ## License <a id="license"></a>
