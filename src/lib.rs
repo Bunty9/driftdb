@@ -2,10 +2,12 @@
 //!
 //! Embeddable LSM-tree key-value engine. Write path:
 //! `put → WAL (group-commit fsync) → memtable → freeze → flush → L0 SST → compactor → L1+`.
-//! Read path: memtable → frozen memtable → L0 (newest first) → L1+ (bloom-filtered).
-//! Keys carry a `(user_key, seqno)` pair for MVCC snapshot reads.
+//! Read path: memtable → frozen memtable(s) → L0 (newest first) → L1+ (binary search,
+//! bloom-filtered inside each SST). Keys carry a `(user_key, seqno)` pair for MVCC snapshot
+//! reads; a single dedicated writer thread group-commits batches to the WAL, and a single
+//! background thread owns flush + leveled compaction.
 //!
-//! See [`projects-l3-l4.md`](../../projects-l3-l4.md) § P5 for the full design.
+//! See `docs/plans/2026-09-25-driftdb-phase-2.md` for the full design.
 //!
 //! ## Quick start
 //!
@@ -15,6 +17,8 @@
 //! # async fn run() -> Result<()> {
 //! let db = Db::open("/tmp/driftdb-demo").await?;
 //! db.put(b"hello", b"world").await?;
+//! assert_eq!(db.get(b"hello").await?.as_deref(), Some(&b"world"[..]));
+//! db.flush().await?; // force a flush to L0, just to demonstrate it's there
 //! assert_eq!(db.get(b"hello").await?.as_deref(), Some(&b"world"[..]));
 //! # Ok(())
 //! # }
@@ -32,5 +36,5 @@ pub mod memtable;
 pub mod sstable;
 pub mod wal;
 
-pub use crate::db::{Db, Snapshot};
+pub use crate::db::{Db, Options, Snapshot, Stats, WriteBatch};
 pub use crate::error::{Error, Result};
