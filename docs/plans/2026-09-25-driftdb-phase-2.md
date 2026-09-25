@@ -119,7 +119,12 @@ pub fn compaction_filter<'a>(inner: BoxIter<'a>, oldest_snapshot: u64, drop_tomb
 ### `sstable.rs`
 
 Data block on disk: `[u32 BE compressed_len][u32 BE crc32(compressed)][zstd bytes]`.
-Index/bloom/footer as in Phase 1.
+Index (bincode `Vec<(last_key, block_offset)>`) and bloom (bincode `GrowableBloom`) blocks
+follow the data blocks, then a 32-byte footer: `[u64 BE index_off][u64 BE bloom_off]
+[u32 BE crc32(index..bloom)][u32 BE reserved][u64 BE magic=0xDEADBEEF]`. The crc covers the
+whole index+bloom region and is checked in `open` before either is bincode-deserialized, so a
+corrupt index can't silently skip blocks and a corrupt bloom can't be handed straight to
+`growable-bloom-filter`'s deserializer (which isn't guaranteed to fail cleanly on garbage).
 
 ```rust
 pub struct SstSummary { pub smallest: Vec<u8>, pub largest: Vec<u8>,

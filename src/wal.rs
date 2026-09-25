@@ -42,6 +42,13 @@ const HEADER_LEN: usize = 4 + 8 + 1 + 4 + 4;
 const KIND_DELETE: u8 = 0;
 const KIND_PUT: u8 = 1;
 
+/// Largest key `WalFile::append` (and the rest of the on-disk formats) will encode. `Db`
+/// rejects larger inputs before they ever reach here — this module only `debug_assert`s it.
+pub const MAX_KEY_LEN: usize = 65_535;
+/// Largest value `WalFile::append` (and the rest of the on-disk formats) will encode. `Db`
+/// rejects larger inputs before they ever reach here — this module only `debug_assert`s it.
+pub const MAX_VALUE_LEN: usize = 256 * 1024 * 1024;
+
 /// Path for WAL generation `number` inside `dir` — `dir/wal-NNNNNN.log`.
 pub fn wal_path(dir: &Path, number: u64) -> PathBuf {
     dir.join(format!("wal-{number:06}.log"))
@@ -121,11 +128,24 @@ impl WalFile {
     }
 
     /// Encode one record and append it to the in-memory buffer. Not durable until `sync`.
+    ///
+    /// Debug-only sanity check against [`MAX_KEY_LEN`]/[`MAX_VALUE_LEN`] — enforcement lives in
+    /// `Db`, which rejects oversized inputs before they get here.
     pub fn append(&mut self, seq: u64, key: &[u8], val: &Value) {
         let (kind, val_bytes): (u8, &[u8]) = match val {
             Value::Put(v) => (KIND_PUT, v.as_slice()),
             Value::Delete => (KIND_DELETE, &[]),
         };
+        debug_assert!(
+            key.len() <= MAX_KEY_LEN,
+            "WalFile::append: key length {} exceeds MAX_KEY_LEN ({MAX_KEY_LEN}); Db must reject this before it reaches the WAL",
+            key.len()
+        );
+        debug_assert!(
+            val_bytes.len() <= MAX_VALUE_LEN,
+            "WalFile::append: value length {} exceeds MAX_VALUE_LEN ({MAX_VALUE_LEN}); Db must reject this before it reaches the WAL",
+            val_bytes.len()
+        );
         let body_len = 8 + 1 + 4 + 4 + key.len() + val_bytes.len();
         let mut body = Vec::with_capacity(body_len);
         body.extend_from_slice(&seq.to_be_bytes());
@@ -415,6 +435,24 @@ mod tests {
         let files = list_wal_files(dir.path()).expect("list");
         let numbers: Vec<u64> = files.iter().map(|(n, _)| *n).collect();
         assert_eq!(numbers, vec![1, 2, 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds MAX_KEY_LEN")]
+    fn append_debug_asserts_against_oversized_key() {
+        let dir = tempdir().expect("tempdir");
+        let mut wal = WalFile::create(dir.path(), 1).expect("create");
+        let oversized_key = vec![0u8; MAX_KEY_LEN + 1];
+        wal.append(1, &oversized_key, &Value::Put(b"v".to_vec()));
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds MAX_VALUE_LEN")]
+    fn append_debug_asserts_against_oversized_value() {
+        let dir = tempdir().expect("tempdir");
+        let mut wal = WalFile::create(dir.path(), 1).expect("create");
+        let oversized_val = vec![0u8; MAX_VALUE_LEN + 1];
+        wal.append(1, b"k", &Value::Put(oversized_val));
     }
 
     #[test]
