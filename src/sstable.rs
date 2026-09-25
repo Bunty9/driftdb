@@ -90,8 +90,7 @@ impl<W: Write> SstWriter<W> {
 
     fn flush_block(&mut self) -> std::io::Result<()> {
         let compressed = zstd::encode_all(&self.block_buf[..], 3)?;
-        self.w
-            .write_all(&(compressed.len() as u32).to_be_bytes())?;
+        self.w.write_all(&(compressed.len() as u32).to_be_bytes())?;
         self.w.write_all(&compressed)?;
         self.index.push((self.last_key.clone(), self.offset));
         self.offset += 4 + compressed.len() as u64;

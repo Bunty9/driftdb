@@ -137,7 +137,8 @@ impl Db {
             ))
         })?;
         self.state.last_seq.store(seq, Ordering::Release);
-        self.active.insert(key.to_vec(), seq, Value::Put(val.to_vec()));
+        self.active
+            .insert(key.to_vec(), seq, Value::Put(val.to_vec()));
         Ok(())
     }
 

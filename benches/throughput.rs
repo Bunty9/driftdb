@@ -30,9 +30,7 @@ fn bench_puts(c: &mut Criterion) {
             let mut total = std::time::Duration::ZERO;
             for _ in 0..iters {
                 let dir = TempDir::new().expect("tempdir");
-                let db = rt
-                    .block_on(Db::open(dir.path()))
-                    .expect("open driftdb");
+                let db = rt.block_on(Db::open(dir.path())).expect("open driftdb");
                 let start = std::time::Instant::now();
                 for i in 0..N {
                     let k = format!("k{:08}", pseudo_random(i));

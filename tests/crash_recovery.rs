@@ -29,9 +29,7 @@ async fn reopen_sees_previously_written_keys() {
         for i in 0..N {
             let key = format!("k{:08}", i);
             let val = format!("v{}", i);
-            db.put(key.as_bytes(), val.as_bytes())
-                .await
-                .expect("put");
+            db.put(key.as_bytes(), val.as_bytes()).await.expect("put");
         }
         // Implicit drop here — WAL records are durable thanks to group-commit,
         // but no clean shutdown signal is sent.

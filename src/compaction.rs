@@ -62,10 +62,7 @@ pub fn pick_compaction<S: CompactionState>(_state: &S) -> Option<CompactionPlan>
 /// output SST(s), append `SstAdded` + `SstDeleted` to the manifest, unlink the obsolete files.
 ///
 /// **Phase 1 status:** no-op.
-pub async fn run_compaction<S: CompactionState>(
-    _state: &S,
-    _plan: CompactionPlan,
-) -> Result<()> {
+pub async fn run_compaction<S: CompactionState>(_state: &S, _plan: CompactionPlan) -> Result<()> {
     // Phase 2: merge-iterator + SstWriter + manifest append + unlink.
     Ok(())
 }

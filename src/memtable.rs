@@ -68,7 +68,13 @@ impl Memtable {
                 Value::Delete => 0,
             };
         self.approx_bytes.fetch_add(bytes + 16, Ordering::Relaxed);
-        self.map.insert(InternalKey { user_key: key, seqno }, val);
+        self.map.insert(
+            InternalKey {
+                user_key: key,
+                seqno,
+            },
+            val,
+        );
     }
 
     /// Snapshot read: find the first version `<= snapshot_seq` for `user_key`. Returns `None`
