@@ -28,6 +28,11 @@ pub enum Error {
     /// bincode (de)serialization failed — used by the manifest log and the SSTable footer.
     #[error("bincode: {0}")]
     Bincode(#[from] bincode::Error),
+
+    /// SSTable file failed validation on open or during a block read: truncated file, bad
+    /// magic/footer offsets, a block that failed its CRC check, or a malformed index/bloom.
+    #[error("sst corrupt: {0}")]
+    SstCorrupt(String),
 }
 
 /// Crate-wide `Result` alias.
