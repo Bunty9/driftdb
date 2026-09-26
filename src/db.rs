@@ -1069,6 +1069,12 @@ impl Drop for Guard {
 
 /// The public handle. Cheap to clone (`Arc` under the hood). Every write blocks on the writer
 /// thread's group commit; every read is lock-free past a couple of short `RwLock` reads.
+///
+/// Dropping the last clone joins the writer and background threads synchronously (see
+/// `Guard::shutdown_and_join`) -- which may block on an in-progress flush or compaction -- so
+/// data acked before the drop is never lost even if the caller never calls `close()`. Prefer
+/// [`Db::close`] explicitly where possible, though: it's the same join, but `async` (via
+/// `spawn_blocking`) instead of blocking whatever thread happens to run the final `Drop`.
 #[derive(Clone)]
 pub struct Db {
     guard: Arc<Guard>,
@@ -1166,6 +1172,11 @@ impl Db {
     /// versions/tombstones -- from the same `snapshots` map). Registering first closes that
     /// window: `oldest_snapshot()` can never be computed as newer than a `seq` that's already
     /// registered. Dropping registration entirely would reopen it, so it stays.
+    ///
+    /// Runs inline on the calling task, unlike [`Db::scan`]. `get` touches at most one block per
+    /// SST level (bloom-filtered, mmap-backed) rather than a whole range, so its worst-case I/O
+    /// and decompression cost is bounded and small enough to not need `spawn_blocking`'s
+    /// overhead.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let inner = &self.guard.inner;
         let seq = inner.register_snapshot();
@@ -1176,12 +1187,23 @@ impl Db {
 
     /// Full range scan at the current seqno (see [`Snapshot::scan`] for a fixed-seqno version).
     /// Same short-lived-snapshot protection as [`Db::get`].
+    ///
+    /// Unlike `get`, a scan's disk I/O and decompression cost scales with the range's size and
+    /// isn't bounded, so it runs on a `spawn_blocking` thread rather than inline on the calling
+    /// async task -- otherwise a large scan would stall every other task on the same tokio
+    /// worker thread for as long as it took to walk the range.
     pub async fn scan<R: RangeBounds<Vec<u8>>>(&self, range: R) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let inner = &self.guard.inner;
-        let seq = inner.register_snapshot();
-        let result = inner.scan_at(range, seq);
-        inner.unregister_snapshot(seq);
-        result
+        let owned_range: (Bound<Vec<u8>>, Bound<Vec<u8>>) =
+            (range.start_bound().cloned(), range.end_bound().cloned());
+        let inner = self.guard.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let seq = inner.register_snapshot();
+            let result = inner.scan_at(owned_range, seq);
+            inner.unregister_snapshot(seq);
+            result
+        })
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?
     }
 
     /// Open a read snapshot at the current seqno. Compaction won't drop any version a live
