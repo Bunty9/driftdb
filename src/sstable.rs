@@ -29,15 +29,15 @@
 //! input (it can panic or allocate wildly instead) — the checksum turns both into an ordinary
 //! `Error::SstCorrupt` instead.
 //!
-//! There is no block cache: every [`SstReader::get`] or iterator step decompresses its block
-//! fresh from the mmap.
-//! ponytail: add an LRU block cache keyed by (file, block_offset) if read latency under
-//! compaction/read-storm ever shows up as a bottleneck; until then the OS page cache over the
-//! mmap absorbs most of the cost.
+//! Each [`SstReader`] keeps a tiny per-table LRU of decompressed blocks (see [`BlockCache`])
+//! so a hot key under a skewed (Zipfian) read workload doesn't pay zstd-decode on every single
+//! `get()`. Blocks are immutable once written, so the cache never needs invalidation.
 
 use crate::error::Error;
 use crate::memtable::{Entry, Value};
 use growable_bloom_filter::GrowableBloom;
+use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -249,6 +249,45 @@ impl<W: Write> SstWriter<W> {
     }
 }
 
+/// Number of decompressed blocks kept per [`SstReader`]. Small on purpose: this is a per-table
+/// cache (one of these exists per open SST), and a Zipfian-skewed read workload concentrates on
+/// a handful of blocks per hot table, not the whole file.
+const BLOCK_CACHE_CAPACITY: usize = 8;
+
+/// Tiny LRU of decompressed blocks, keyed by data-region offset. Linear scan is fine at
+/// [`BLOCK_CACHE_CAPACITY`]'s size; most-recently-used sits at the front.
+///
+/// ponytail: a per-table cache this small won't help a scan that touches every block exactly
+/// once (compaction, full iteration) — it's aimed at `get()`'s repeat hits on the same hot
+/// block. Widen it (or shard across tables) if profiling ever shows point-read p99 still
+/// dominated by decompression with this in place.
+#[derive(Debug, Default)]
+struct BlockCache {
+    entries: Mutex<VecDeque<(u64, Arc<Vec<Entry>>)>>,
+}
+
+impl BlockCache {
+    fn get(&self, offset: u64) -> Option<Arc<Vec<Entry>>> {
+        let mut entries = self.entries.lock();
+        let pos = entries.iter().position(|(o, _)| *o == offset)?;
+        let hit = entries.remove(pos).expect("position just found");
+        let block = hit.1.clone();
+        entries.push_front(hit);
+        Some(block)
+    }
+
+    fn insert(&self, offset: u64, block: Arc<Vec<Entry>>) {
+        let mut entries = self.entries.lock();
+        if entries.iter().any(|(o, _)| *o == offset) {
+            return; // lost a race with another reader decoding the same block; keep the winner.
+        }
+        if entries.len() >= BLOCK_CACHE_CAPACITY {
+            entries.pop_back();
+        }
+        entries.push_front((offset, block));
+    }
+}
+
 /// Read handle for an on-disk SSTable. Holds the mmap region + parsed index + bloom. Cheap to
 /// clone-by-`Arc`; `open` does all the validation work up front so later reads never panic on
 /// a corrupt file — they return [`Error::SstCorrupt`] instead.
@@ -259,6 +298,7 @@ pub struct SstReader {
     /// Byte length of the data-block region (== index_off from the footer).
     data_len: u64,
     path: PathBuf,
+    block_cache: BlockCache,
 }
 
 impl std::fmt::Debug for SstReader {
@@ -350,12 +390,27 @@ impl SstReader {
             bloom,
             data_len: index_off,
             path: path.to_path_buf(),
+            block_cache: BlockCache::default(),
         })
     }
 
+    /// [`Self::decode_block`], but checks (and populates) the per-table [`BlockCache`] first —
+    /// used by [`SstReader::get`], where a skewed workload repeatedly hits the same block. Not
+    /// used by [`SstIter`]: a full scan touches each block exactly once, so caching it would
+    /// only add an `Arc` clone with no hit-rate payoff -- see [`SstIter::next`].
+    fn read_block(&self, offset: u64) -> crate::Result<Arc<Vec<Entry>>> {
+        if let Some(cached) = self.block_cache.get(offset) {
+            return Ok(cached);
+        }
+        let entries = Arc::new(self.decode_block(offset)?);
+        self.block_cache.insert(offset, entries.clone());
+        Ok(entries)
+    }
+
     /// Decode + decompress the block starting at byte `offset` in the data region, returning
-    /// its entries in on-disk order. Bounds- and crc-checked; corruption never panics.
-    fn read_block(&self, offset: u64) -> crate::Result<Vec<Entry>> {
+    /// its entries in on-disk order. Bounds- and crc-checked; corruption never panics. Does not
+    /// touch the [`BlockCache`] -- see [`SstReader::read_block`].
+    fn decode_block(&self, offset: u64) -> crate::Result<Vec<Entry>> {
         let data = &self.mmap[..self.data_len as usize];
         let start = offset as usize;
         let header_end = start.checked_add(BLOCK_HEADER_LEN).ok_or_else(|| {
@@ -462,15 +517,15 @@ impl SstReader {
 
         for (_, offset) in self.index.iter().skip(start_block) {
             let entries = self.read_block(*offset)?;
-            for (k, seq, val) in entries {
+            for (k, seq, val) in entries.iter() {
                 match k.as_slice().cmp(user_key) {
                     std::cmp::Ordering::Less => continue,
                     std::cmp::Ordering::Greater => return Ok(None),
                     std::cmp::Ordering::Equal => {
-                        if seq <= snapshot_seq {
+                        if *seq <= snapshot_seq {
                             // Entries for one key are seq DESC, so the first qualifying
                             // version we see is the newest visible one.
-                            return Ok(Some(val));
+                            return Ok(Some(val.clone()));
                         }
                     }
                 }
@@ -540,7 +595,10 @@ impl Iterator for SstIter {
             }
             let offset = self.reader.index[self.next_block].1;
             self.next_block += 1;
-            match self.reader.read_block(offset) {
+            // `decode_block`, not the cached `read_block`: a full scan touches each block
+            // exactly once, so bypassing the cache keeps this a plain owning move (no `Arc`,
+            // no clone) -- exactly as before the cache existed.
+            match self.reader.decode_block(offset) {
                 Ok(entries) => self.current = entries.into_iter(),
                 Err(e) => {
                     self.done = true;
