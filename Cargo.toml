@@ -16,10 +16,6 @@ tokio = { version = "1.47", features = ["sync", "rt", "macros", "time", "fs"] }
 # Concurrent memtable (lock-free skiplist) — the canonical pick from `backend-cloud-roadmap.md` § 3.
 crossbeam-skiplist = "0.1"
 
-# Binary framing — `bytes::BytesMut` for the WAL record builder, `byteorder` for explicit endianness.
-bytes = "1"
-byteorder = "1"
-
 # Block compression for SSTable data blocks. Level 3 is the LevelDB/RocksDB default.
 zstd = "0.13"
 
@@ -48,8 +44,7 @@ bincode = "1.3"
 # Manifest records are `Serialize`/`Deserialize`.
 serde = { version = "1", features = ["derive"] }
 
-# Errors. `anyhow` is for binaries; we use `thiserror` for the library surface.
-anyhow = "1"
+# Errors: `thiserror` for the library surface.
 thiserror = "2"
 
 # Structured logging. The library emits spans/events; binaries set up the subscriber.

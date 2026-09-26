@@ -7,7 +7,12 @@ no-default-features = false
 [advisories]
 version = 2
 yanked = "warn"
-ignore = []
+ignore = [
+    # bincode 1.x is unmaintained, but it is feature-complete and pinned on purpose:
+    # the SST index/bloom and manifest formats are defined by its 1.x encoding
+    # (README "bincode for index serialization"). Replacing it is a format change.
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x pinned; on-disk format depends on it" },
+]
 
 [bans]
 multiple-versions = "warn"
@@ -26,6 +31,7 @@ allow = [
     "Unicode-DFS-2016",
     "Unicode-3.0",
     "Zlib",
+    "BSL-1.0",
     "MPL-2.0",
     "CC0-1.0",
     "OpenSSL",
