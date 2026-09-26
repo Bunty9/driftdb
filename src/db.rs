@@ -26,7 +26,7 @@ use std::io::BufWriter;
 use std::ops::{Bound, RangeBounds};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
@@ -220,12 +220,23 @@ struct Inner {
     snapshots: Mutex<BTreeMap<u64, usize>>,
     fatal: Mutex<Option<String>>,
     shutdown: AtomicBool,
-    /// Set by `Db::compact()` while a forced full compaction is in flight; the background
-    /// thread's picker consults it to bypass the normal trigger thresholds.
-    force_compact: AtomicBool,
+    /// Count of `Db::compact()` calls currently in flight (fetch_add on entry, fetch_sub on
+    /// exit); the background thread's picker bypasses the normal trigger thresholds while this
+    /// is nonzero. A plain bool would livelock two concurrent `compact()` callers: whichever
+    /// finishes first would reset it to "off" while the other is still waiting for
+    /// `pick_forced` to run, and the picker would silently go back to the normal thresholds and
+    /// never satisfy the still-waiting caller.
+    force_compact: AtomicUsize,
     /// Set by `bg_thread` while it's actually inside `do_flush`/`do_compact` (not just picking
     /// work or sleeping). Read by `Stats::background_idle`.
     bg_busy: AtomicBool,
+    /// Cleared (via an RAII guard) the moment `bg_thread` returns, including on panic. Belt and
+    /// braces for `wait_flushed`/`rotate`'s stall loop: with `Guard::shutdown_and_join`'s
+    /// join-writer-before-shutdown ordering, the background thread should never exit while a
+    /// memtable a caller is waiting on is still unflushed -- but if it ever does (e.g. a panic),
+    /// this lets those callers return an error instead of polling forever for a flush that will
+    /// never come.
+    bg_alive: AtomicBool,
     work_mu: Mutex<()>,
     work_cv: Condvar,
     stall_mu: Mutex<()>,
@@ -564,6 +575,11 @@ impl Inner {
 
     /// Block (synchronously) until the frozen memtable tagged `wal_number` has been flushed
     /// (or, if `fatal` gets set first, return that error). Called from a `spawn_blocking` task.
+    ///
+    /// Also bails out if the background thread -- the only thing that can ever flush
+    /// `wal_number` -- has exited while the target is still unflushed (see `bg_alive`'s doc):
+    /// belt and braces so this polls at most a little past that, rather than forever, if the
+    /// shutdown-ordering invariant `Guard::shutdown_and_join` relies on is ever violated.
     fn wait_flushed(&self, wal_number: u64) -> Result<()> {
         loop {
             self.check_fatal()?;
@@ -576,15 +592,25 @@ impl Inner {
             {
                 return Ok(());
             }
+            if !self.bg_alive.load(Ordering::SeqCst) {
+                return Err(Error::Io(std::io::Error::other(format!(
+                    "driftdb: background thread exited before flushing wal {wal_number}"
+                ))));
+            }
             let mut g = self.flush_mu.lock();
             self.flush_cv.wait_for(&mut g, Duration::from_millis(50));
         }
     }
 
-    /// Force a full compaction: flag it, wake the background thread, then block until
-    /// `pick_forced` has nothing left. Called from a `spawn_blocking` task.
+    /// Force a full compaction: bump the in-flight counter, wake the background thread, then
+    /// block until `pick_forced` has nothing left. Called from a `spawn_blocking` task.
+    ///
+    /// Under sustained concurrent writes this can run for a long time: every flush installs a
+    /// new L0 file, which restarts the compaction cascade `pick_forced` is draining, so a
+    /// `compact()` racing a steady stream of writers may not see `pick_forced` return `None`
+    /// until the writes stop (or slow down enough for compaction to catch up).
     fn compact_blocking(&self) -> Result<()> {
-        self.force_compact.store(true, Ordering::SeqCst);
+        self.force_compact.fetch_add(1, Ordering::SeqCst);
         self.notify_bg();
         let result = loop {
             if let Err(e) = self.check_fatal() {
@@ -594,10 +620,15 @@ impl Inner {
             if compaction::pick_forced(&metas, &self.options).is_none() {
                 break Ok(());
             }
+            if !self.bg_alive.load(Ordering::SeqCst) {
+                break Err(Error::Io(std::io::Error::other(
+                    "driftdb: background thread exited before forced compaction finished",
+                )));
+            }
             let mut g = self.flush_mu.lock();
             self.flush_cv.wait_for(&mut g, Duration::from_millis(50));
         };
-        self.force_compact.store(false, Ordering::SeqCst);
+        self.force_compact.fetch_sub(1, Ordering::SeqCst);
         result
     }
 }
@@ -617,10 +648,20 @@ fn as_option(v: Value) -> Option<Vec<u8>> {
 /// comment.
 const MAX_IMMUTABLE_MEMTABLES: usize = 2;
 
-/// Freeze the active memtable and open a fresh WAL, stalling (respecting shutdown/fatal) while
-/// `MAX_IMMUTABLE_MEMTABLES` frozen memtables are already waiting on the background thread.
-/// Returns the WAL number the just-frozen memtable is tagged with, or `None` if the active
-/// memtable was empty. Only ever called from the writer thread.
+/// Freeze the active memtable and open a fresh WAL, stalling while `MAX_IMMUTABLE_MEMTABLES`
+/// frozen memtables are already waiting on the background thread. Returns the WAL number the
+/// just-frozen memtable is tagged with, or `None` if the active memtable was empty. Only ever
+/// called from the writer thread.
+///
+/// The stall loop only checks `fatal`, not `shutdown`: `rotate` runs exclusively on the writer
+/// thread, and `Guard::shutdown_and_join` only ever sets `shutdown` *after* the writer thread has
+/// already been joined (so that the background thread can't observe `shutdown` and exit while
+/// the writer is still about to freeze a memtable it needs to flush -- see that function's doc).
+/// By the time `shutdown` could possibly be true, this function isn't running anymore either, so
+/// there is nothing for it to respect here. It does check `bg_alive` (belt and braces, same
+/// rationale as `wait_flushed`): if the background thread -- the only thing that ever drains
+/// `immutables` -- has exited while the backlog is still full, nothing will ever unstall this
+/// loop, so it errors out instead of stalling forever.
 fn rotate(inner: &Inner, wal: &mut WalFile) -> Result<Option<u64>> {
     {
         let mem = inner.mem.read();
@@ -636,6 +677,11 @@ fn rotate(inner: &Inner, wal: &mut WalFile) -> Result<Option<u64>> {
             break;
         }
         inner.check_fatal()?;
+        if !inner.bg_alive.load(Ordering::SeqCst) {
+            return Err(Error::Io(std::io::Error::other(
+                "driftdb: background thread exited while writes were stalled waiting for a flush",
+            )));
+        }
         let mut g = inner.stall_mu.lock();
         if inner.mem.read().immutables.len() >= MAX_IMMUTABLE_MEMTABLES {
             inner.stall_cv.wait_for(&mut g, Duration::from_millis(50));
@@ -845,10 +891,22 @@ fn writer_thread(inner: Arc<Inner>, rx: mpsc::Receiver<Req>, mut wal: WalFile) {
     let _ = wal.sync();
 }
 
+/// RAII flip of `Inner::bg_alive` back to `false` when `bg_thread` returns -- including via an
+/// unwinding panic, so `wait_flushed`/`rotate`'s belt-and-braces checks can't be fooled by a
+/// stale `true` left behind by a background thread that died unexpectedly.
+struct BgAliveGuard<'a>(&'a AtomicBool);
+
+impl Drop for BgAliveGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// The single background thread: flushes frozen memtables (oldest first) then runs compaction,
 /// repeating until there's nothing left, then sleeps until woken. Exits once shutdown has been
 /// requested and every frozen memtable has been drained.
 fn bg_thread(inner: Arc<Inner>) {
+    let _bg_alive_guard = BgAliveGuard(&inner.bg_alive);
     loop {
         loop {
             if inner.fatal.lock().is_some() {
@@ -868,7 +926,7 @@ fn bg_thread(inner: Arc<Inner>) {
             }
             let version = inner.version.read().clone();
             let metas = version.level_metas();
-            let plan = if inner.force_compact.load(Ordering::SeqCst) {
+            let plan = if inner.force_compact.load(Ordering::SeqCst) > 0 {
                 compaction::pick_forced(&metas, &inner.options)
             } else {
                 compaction::pick(&metas, &inner.options)
@@ -895,11 +953,16 @@ fn bg_thread(inner: Arc<Inner>) {
         // must be able to tear this thread down immediately regardless of leftover `immutables`
         // or an in-flight forced compaction -- otherwise a flush/fsync failure leaves a frozen
         // memtable stuck forever and `Guard::shutdown_and_join` (close()/Drop) never returns.
+        //
+        // `Guard::shutdown_and_join` only sets `shutdown` after the writer thread has already
+        // been joined, so by the time this observes `shutdown == true`, the writer can no
+        // longer be about to freeze a new immutable memtable behind this thread's back -- every
+        // one it will ever produce is already in `mem.immutables` (or already flushed).
         let fatal = inner.fatal.lock().is_some();
         if inner.shutdown.load(Ordering::SeqCst)
             && (fatal
                 || (inner.mem.read().immutables.is_empty()
-                    && !inner.force_compact.load(Ordering::SeqCst)))
+                    && inner.force_compact.load(Ordering::SeqCst) == 0))
         {
             break;
         }
@@ -950,17 +1013,49 @@ struct Guard {
     /// `Db::open` on the same directory can never race the writer/background threads while they
     /// still have the WAL or manifest open.
     lock: Mutex<Option<std::fs::File>>,
+    /// Serializes `shutdown_and_join` across concurrent callers (e.g. two overlapping
+    /// `Db::close()` calls, or one racing the final `Drop`). Without this, a losing caller could
+    /// still set `shutdown = true` of its own accord before the winning caller's writer-thread
+    /// join finishes, reopening the exact early-shutdown race `shutdown_and_join` exists to
+    /// close. Held for the whole call so a second caller only proceeds (to what is then a no-op)
+    /// once the first has fully finished.
+    shutdown_mu: Mutex<()>,
 }
 
 impl Guard {
+    /// Idempotent. Order matters here: dropping the sender and joining the writer thread
+    /// *before* setting `shutdown` is what makes this safe against the race that used to let
+    /// the background thread exit early.
+    ///
+    /// Old bug: `shutdown` was set first. The background thread could then observe
+    /// `shutdown == true` with `mem.immutables` empty and exit, while the writer thread was
+    /// still draining its already-queued requests and about to `rotate` one last active
+    /// memtable into `immutables` -- which would then sit there forever with nothing left to
+    /// flush it. A concurrent `flush()`'s `wait_flushed` (or a concurrent `rotate`'s stall
+    /// loop, if the backlog was full) would then poll forever for a flush that could never
+    /// come.
+    ///
+    /// Fix: drop the sender (so `writer_thread`'s `rx.recv()` drains whatever's already queued
+    /// and returns once empty) and join the writer thread FIRST, while the background thread is
+    /// still very much alive and able to pick up anything the writer freezes. Only once the
+    /// writer has fully stopped -- meaning every immutable memtable it will ever produce is
+    /// already sitting in `mem.immutables` -- is it safe to set `shutdown` and let the
+    /// background thread drain the rest and exit.
     fn shutdown_and_join(&self) {
-        self.inner.shutdown.store(true, Ordering::SeqCst);
+        let _serialize = self.shutdown_mu.lock();
         *self.sender.lock() = None;
-        self.inner.notify_bg();
-        self.inner.notify_all_waiters();
         if let Some((writer, bg)) = self.handles.lock().take() {
             let _ = writer.join();
+            self.inner.shutdown.store(true, Ordering::SeqCst);
+            self.inner.notify_bg();
+            self.inner.notify_all_waiters();
             let _ = bg.join();
+        } else {
+            // Handles already taken by an earlier call (or another thread racing this one) --
+            // still make sure `shutdown` is set and everyone still waiting gets woken.
+            self.inner.shutdown.store(true, Ordering::SeqCst);
+            self.inner.notify_bg();
+            self.inner.notify_all_waiters();
         }
         *self.lock.lock() = None;
     }
@@ -1114,6 +1209,12 @@ impl Db {
 
     /// Flush, then force compaction until every level is under budget (or, in the case of L0
     /// and any level over its byte budget, fully drained one file at a time down to the bottom).
+    ///
+    /// Safe to call concurrently from multiple tasks -- each waits for the levels to actually
+    /// be drained rather than for some other caller's flag. Under sustained concurrent writes,
+    /// though, this can run for a long time (or, in principle, indefinitely if writes never let
+    /// up): every flush adds a new L0 file, which restarts the compaction cascade this is
+    /// waiting to drain.
     pub async fn compact(&self) -> Result<()> {
         self.flush().await?;
         let inner = self.guard.inner.clone();
@@ -1308,8 +1409,9 @@ fn open_sync(dir: &Path, options: Options) -> Result<Db> {
         snapshots: Mutex::new(BTreeMap::new()),
         fatal: Mutex::new(None),
         shutdown: AtomicBool::new(false),
-        force_compact: AtomicBool::new(false),
+        force_compact: AtomicUsize::new(0),
         bg_busy: AtomicBool::new(false),
+        bg_alive: AtomicBool::new(true),
         work_mu: Mutex::new(()),
         work_cv: Condvar::new(),
         stall_mu: Mutex::new(()),
@@ -1337,6 +1439,7 @@ fn open_sync(dir: &Path, options: Options) -> Result<Db> {
         sender: Mutex::new(Some(tx)),
         handles: Mutex::new(Some((writer_handle, bg_handle))),
         lock: Mutex::new(Some(lock_file)),
+        shutdown_mu: Mutex::new(()),
     });
     Ok(Db { guard })
 }

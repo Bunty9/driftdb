@@ -5,6 +5,7 @@
 use driftdb::{Db, Options, WriteBatch};
 use std::collections::BTreeMap;
 use std::ops::Bound;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -500,4 +501,124 @@ async fn snapshot_never_observes_a_version_gcd_by_a_racing_compaction() {
             "snapshot registered at seq {seq} saw a version compaction had already GC'd"
         );
     }
+}
+
+/// Regression test for the `shutdown_and_join` ordering bug: `shutdown` used to be set before
+/// the writer thread was joined, so the background thread could observe "shutdown requested,
+/// nothing frozen right now" and exit while the writer was still about to freeze one last
+/// active memtable -- orphaning it forever and making a concurrent `flush()` (or a `rotate`
+/// stalled on a full backlog) poll forever for a flush that would never come. With the fix
+/// (join the writer first, only then signal the background thread), `close()` and any
+/// in-flight `flush()` must always resolve, and every write acked before `close()` returned
+/// must survive a reopen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn close_during_concurrent_writes_and_flush_does_not_hang() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut opts = small_options();
+    opts.memtable_size = 2 * 1024; // tiny: rotates constantly under concurrent load.
+    let db = Db::open_with(dir.path(), opts).await.expect("open");
+
+    const WORKERS: u32 = 8;
+    const PER_WORKER: u32 = 300;
+
+    let acked: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut tasks = Vec::new();
+    for worker in 0..WORKERS {
+        let db = db.clone();
+        let acked = acked.clone();
+        tasks.push(tokio::spawn(async move {
+            for i in 0..PER_WORKER {
+                let k = format!("w{worker}-k{i:04}").into_bytes();
+                let v = format!("v{worker}-{i}").into_bytes();
+                if db.put(&k, &v).await.is_ok() {
+                    acked.lock().unwrap().push(k);
+                }
+                // Deliberately no yield/sleep here: keep the writer thread's queue saturated so
+                // `close()` below races real in-flight writes/rotates instead of an idle queue.
+            }
+        }));
+    }
+
+    let flush_db = db.clone();
+    let flush_task = tokio::spawn(async move { flush_db.flush().await });
+
+    // Give the workers a moment to actually get requests queued before closing.
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    tokio::time::timeout(Duration::from_secs(30), db.close())
+        .await
+        .expect("close() must not hang")
+        .expect("close() failed");
+
+    // Must resolve one way or another (Ok if its rotate/wait_flushed made it through before
+    // close, Err if it lost the race) -- hanging is the bug this test guards against.
+    let _ = tokio::time::timeout(Duration::from_secs(30), flush_task)
+        .await
+        .expect("flush() task must not hang")
+        .expect("flush task panicked");
+
+    for t in tasks {
+        t.await.expect("writer task panicked");
+    }
+
+    let acked = acked.lock().unwrap().clone();
+    drop(db);
+
+    let db2 = Db::open_with(dir.path(), small_options())
+        .await
+        .expect("reopen");
+    for k in &acked {
+        assert!(
+            db2.get(k).await.expect("get").is_some(),
+            "acked key {k:?} missing after reopen"
+        );
+    }
+}
+
+/// Regression test for the `force_compact` bool-vs-livelock bug: with a plain bool, whichever
+/// concurrent `compact()` call finished first reset it to "off" while the other was still
+/// waiting for `pick_forced` to find nothing left -- so the background thread's picker would
+/// fall back to the normal (non-forced) thresholds and never satisfy the still-waiting caller.
+/// With an `AtomicUsize` counter, the flag stays "on" as long as any caller is in flight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_compacts_both_finish_with_writes_between() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut opts = small_options();
+    opts.memtable_size = 4 * 1024;
+    let db = Db::open_with(dir.path(), opts).await.expect("open");
+
+    // Seed enough data that there's real, multi-level compaction work to do.
+    let mut batch = WriteBatch::new();
+    for i in 0..2_000u32 {
+        batch = batch.put(format!("k{i:05}").into_bytes(), vec![b'x'; 64]);
+        if batch.len() >= 200 {
+            db.write_batch(std::mem::take(&mut batch))
+                .await
+                .expect("write_batch");
+        }
+    }
+    if !batch.is_empty() {
+        db.write_batch(batch).await.expect("write_batch");
+    }
+
+    let db_a = db.clone();
+    let compact_a = tokio::spawn(async move { db_a.compact().await });
+
+    // More writes while `compact_a` is (likely) in flight -- each flush restarts the cascade
+    // it's waiting to drain, which is exactly what starves a bool-flag version of this.
+    for i in 2_000..2_200u32 {
+        db.put(format!("k{i:05}").into_bytes().as_slice(), &[b'y'; 64])
+            .await
+            .expect("put");
+    }
+
+    let db_b = db.clone();
+    let compact_b = tokio::spawn(async move { db_b.compact().await });
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        compact_a.await.expect("join a").expect("compact a");
+        compact_b.await.expect("join b").expect("compact b");
+    })
+    .await
+    .expect("both concurrent compact() calls must finish, not livelock");
 }
