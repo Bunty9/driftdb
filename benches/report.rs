@@ -7,20 +7,25 @@
 //! real measurement run:
 //!
 //! - `DRIFTDB_BENCH_VALUE_SIZE`          (default 100)   -- value size in bytes, everywhere.
-//! - `DRIFTDB_BENCH_WRITE_TASKS`         (default 64)    -- concurrent writer tasks.
-//! - `DRIFTDB_BENCH_WRITE_OPS_PER_TASK`  (default 300)   -- puts per writer task.
+//! - `DRIFTDB_BENCH_WRITE_OPS_PER_TASK`  (default 300)   -- puts per writer task, per concurrency level.
 //! - `DRIFTDB_BENCH_RECORDS`             (default 20000) -- preload size for the latency benches.
 //! - `DRIFTDB_BENCH_READ_TASKS`          (default 16)    -- concurrent reader tasks (YCSB-C).
 //! - `DRIFTDB_BENCH_READ_OPS_PER_TASK`   (default 500)   -- gets per reader task (YCSB-C).
 //! - `DRIFTDB_BENCH_COMPACTION_READS`    (default 2000)  -- gets issued during the compaction storm.
-//! - `DRIFTDB_BENCH_LOAD_MB`             (default 100)   -- data volume for the write-amp measurement.
-//! - `DRIFTDB_BENCH_RECOVERY_MB`         (default 20)    -- WAL volume for the recovery-time measurement.
+//! - `DRIFTDB_BENCH_LOAD_MB`             (default 200)   -- data volume for the write-amp measurement.
+//! - `DRIFTDB_BENCH_RECOVERY_MB`         (default 20)    -- WAL volume for the raw-replay measurement.
+//!
+//! Write throughput is reported at several concurrency levels (1, 16, 64, 256, 1024 tasks) since
+//! group-commit throughput scales with how many concurrent callers share one `fdatasync`.
 
 use driftdb::{Db, Options, WriteBatch};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+
+/// Concurrency levels the sustained-write-throughput bench reports.
+const WRITE_CONCURRENCY_LEVELS: &[usize] = &[1, 16, 64, 256, 1024];
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -88,6 +93,38 @@ impl Xorshift64 {
     fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
     }
+
+    /// Fill `buf` with pseudo-random bytes -- incompressible, unlike a constant-byte value
+    /// (zstd crushes `vec![b'v'; n]` to almost nothing, which understates both throughput cost
+    /// and write amplification).
+    fn fill(&mut self, buf: &mut [u8]) {
+        let mut i = 0;
+        while i < buf.len() {
+            let bytes = self.next_u64().to_le_bytes();
+            let n = (buf.len() - i).min(8);
+            buf[i..i + n].copy_from_slice(&bytes[..n]);
+            i += n;
+        }
+    }
+}
+
+/// Load `records` `key_at(i) -> <incompressible random bytes>` pairs into `db` via
+/// `write_batch`, `batch_size` ops at a time. Each task/call uses its own `rng` so concurrent
+/// callers don't contend on it.
+async fn load_random(db: &Db, records: usize, value_size: usize, batch_size: usize, seed: u64) {
+    let mut rng = Xorshift64::new(seed);
+    let mut i = 0;
+    while i < records {
+        let end = (i + batch_size).min(records);
+        let mut batch = WriteBatch::new();
+        for j in i..end {
+            let mut value = vec![0u8; value_size];
+            rng.fill(&mut value);
+            batch = batch.put(key_at(j).into_bytes(), value);
+        }
+        db.write_batch(batch).await.expect("write_batch");
+        i = end;
+    }
 }
 
 /// Standard YCSB Zipfian generator (theta = 0.99 skew). See `benches/ycsb.rs` for the derivation.
@@ -128,12 +165,12 @@ impl Zipfian {
     }
 }
 
-/// Sustained concurrent write throughput -- many tasks sharing group commit.
-fn bench_write_throughput(rt: &tokio::runtime::Runtime) -> String {
-    let tasks = env_usize("DRIFTDB_BENCH_WRITE_TASKS", 64);
+/// Sustained write throughput at one concurrency level -- `tasks` tasks sharing group commit,
+/// each writing incompressible random values (see [`Xorshift64::fill`]) so the fsync path isn't
+/// getting an unrealistic assist from zstd crushing constant bytes.
+fn bench_write_throughput_at(rt: &tokio::runtime::Runtime, tasks: usize) -> String {
     let ops_per_task = env_usize("DRIFTDB_BENCH_WRITE_OPS_PER_TASK", 300);
     let value_size = env_usize("DRIFTDB_BENCH_VALUE_SIZE", 100);
-    let value = vec![b'v'; value_size];
 
     let dir = TempDir::new().expect("tempdir");
     let db = rt.block_on(Db::open(dir.path())).expect("open driftdb");
@@ -144,9 +181,11 @@ fn bench_write_throughput(rt: &tokio::runtime::Runtime) -> String {
         let mut set = tokio::task::JoinSet::new();
         for t in 0..tasks {
             let db = db.clone();
-            let value = value.clone();
             set.spawn(async move {
+                let mut rng = Xorshift64::new(0xD00D_0000 ^ t as u64);
+                let mut value = vec![0u8; value_size];
                 for i in 0..ops_per_task {
+                    rng.fill(&mut value);
                     let k = key_at(t * ops_per_task + i);
                     db.put(k.as_bytes(), &value).await.expect("put");
                 }
@@ -289,69 +328,132 @@ fn bench_compaction_storm(rt: &tokio::runtime::Runtime) -> String {
     )
 }
 
-/// Write amplification (`disk_bytes_written / user_bytes_written`) after loading ~`DRIFTDB_BENCH_LOAD_MB`
-/// of data and fully compacting it.
+/// Poll `db.stats()` until per-level byte totals stop changing for a few consecutive polls (or a
+/// generous timeout elapses) -- i.e. wait for the background flush/compaction thread to reach
+/// steady state. Deliberately does *not* force a final `compact()`: that would drive every level
+/// down to the bottom one, which inflates the write-amp number past what a real steady-state
+/// workload (that never runs a manual full compaction) would ever see.
+async fn wait_for_compaction_to_settle(db: &Db) {
+    let mut stable_polls = 0u32;
+    let mut last = db.stats().level_bytes;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while stable_polls < 5 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let cur = db.stats().level_bytes;
+        if cur == last {
+            stable_polls += 1;
+        } else {
+            stable_polls = 0;
+            last = cur;
+        }
+    }
+}
+
+/// Write amplification, RocksDB-style: `(WAL + flush + compaction bytes) / user bytes` (see
+/// `Stats::write_amplification`). Uses a small memtable/L1 budget relative to the load size so
+/// leveled compaction actually pushes data into L2+ (reported via per-level file counts) instead
+/// of everything sitting in L0/L1, loads incompressible random values (constant bytes would let
+/// zstd erase most of the cost), and measures steady state after the load settles -- see
+/// `wait_for_compaction_to_settle`.
 fn bench_write_amplification(rt: &tokio::runtime::Runtime) -> String {
-    let load_mb = env_usize("DRIFTDB_BENCH_LOAD_MB", 100);
+    let load_mb = env_usize("DRIFTDB_BENCH_LOAD_MB", 200);
     let value_size = env_usize("DRIFTDB_BENCH_VALUE_SIZE", 100);
     let records = (load_mb * 1024 * 1024) / approx_record_bytes(value_size);
-    let value = vec![b'v'; value_size];
 
     let dir = TempDir::new().expect("tempdir");
     let options = Options {
-        memtable_size: 2 * 1024 * 1024,
+        memtable_size: 1024 * 1024,
+        l1_max_bytes: 4 * 1024 * 1024,
+        target_file_size: 1024 * 1024,
         ..Options::default()
     };
     let db = rt
         .block_on(Db::open_with(dir.path(), options))
         .expect("open driftdb");
 
-    eprintln!("[write-amp] loading ~{load_mb}MB ({records} records)...");
+    eprintln!("[write-amp] loading ~{load_mb}MB ({records} records, incompressible values)...");
     rt.block_on(async {
-        load(&db, records, &value, 1000).await;
+        load_random(&db, records, value_size, 1000, 0xA5A5_0000).await;
+        db.flush().await.expect("flush");
+        wait_for_compaction_to_settle(&db).await;
     });
-    eprintln!("[write-amp] compacting...");
-    rt.block_on(db.compact()).expect("compact");
 
     let stats = db.stats();
     rt.block_on(db.close()).ok();
     format!(
-        "| write amplification (~{load_mb}MB loaded, fully compacted) | {:.2}x (user {}B, disk {}B) |",
+        "| write amplification (~{load_mb}MB loaded, steady state, no forced compact) | {:.2}x (wal {}B, flush+compact {}B, user {}B) -- level files {:?} |",
         stats.write_amplification(),
+        stats.wal_bytes_written,
+        stats.disk_bytes_written,
         stats.user_bytes_written,
-        stats.disk_bytes_written
+        stats.level_files,
     )
 }
 
-/// Recovery time: write `DRIFTDB_BENCH_RECOVERY_MB` of data to the WAL only (memtable large
-/// enough that nothing flushes), drop the `Db`, then time reopening (WAL replay).
-fn bench_recovery_time(rt: &tokio::runtime::Runtime) -> String {
+/// Raw WAL replay throughput: write `DRIFTDB_BENCH_RECOVERY_MB` of incompressible records
+/// straight to one WAL file (bypassing `Db` entirely -- no manifest, no SST flush), then time
+/// `driftdb::wal::replay` decoding them back out. Isolates the replay decode path from the
+/// SST-flush-on-recovery cost `bench_recovery_time_default` also pays.
+fn bench_raw_replay_throughput(_rt: &tokio::runtime::Runtime) -> String {
+    use driftdb::memtable::Value;
+    use driftdb::wal::{wal_path, WalFile};
+
     let recovery_mb = env_usize("DRIFTDB_BENCH_RECOVERY_MB", 20);
     let value_size = env_usize("DRIFTDB_BENCH_VALUE_SIZE", 100);
     let records = (recovery_mb * 1024 * 1024) / approx_record_bytes(value_size);
-    let value = vec![b'v'; value_size];
 
     let dir = TempDir::new().expect("tempdir");
-    let options = Options {
-        // Large enough that `records` worth of writes never crosses the flush threshold --
-        // everything stays in the WAL for recovery to replay.
-        memtable_size: 1024 * 1024 * 1024,
-        ..Options::default()
-    };
+    let mut rng = Xorshift64::new(0x5EED_5EED);
+    let mut wal = WalFile::create(dir.path(), 1).expect("create wal");
+    for i in 0..records {
+        let mut v = vec![0u8; value_size];
+        rng.fill(&mut v);
+        wal.append((i + 1) as u64, key_at(i).as_bytes(), &Value::Put(v));
+    }
+    wal.sync().expect("sync");
+    let path = wal_path(dir.path(), 1);
+    let bytes_written = std::fs::metadata(&path).expect("metadata").len();
 
-    eprintln!("[recovery] writing ~{recovery_mb}MB to WAL (no flush)...");
+    eprintln!("[raw-replay] replaying {bytes_written} bytes ({records} records)...");
+    let start = Instant::now();
+    let mut count = 0u64;
+    driftdb::wal::replay(&path, |_seq, _key, _val| count += 1).expect("replay");
+    let elapsed = start.elapsed();
+    let mb_per_s = (bytes_written as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
+    format!(
+        "| raw WAL replay throughput ({records} records, {bytes_written}B) | {mb_per_s:.1} MB/s ({elapsed:.2?}, {count} records replayed) |"
+    )
+}
+
+/// Recovery time at default `Options` -- the realistic worst case, per the bound documented on
+/// `Options::memtable_size`: replay never reads more than `memtable_size * 3` bytes of WAL (the
+/// active memtable plus up to `MAX_IMMUTABLE_MEMTABLES` = 2 queued-but-unflushed frozen ones).
+/// Writes fast enough that the background flush thread can't fully drain ahead of it, so this
+/// approximates (rather than guarantees) actually landing on that bound.
+fn bench_recovery_time_default(rt: &tokio::runtime::Runtime) -> String {
+    let value_size = env_usize("DRIFTDB_BENCH_VALUE_SIZE", 100);
+    let options = Options::default();
+    let worst_case_wal_bytes = options.memtable_size * 3;
+    let records = worst_case_wal_bytes / approx_record_bytes(value_size);
+
+    let dir = TempDir::new().expect("tempdir");
+    eprintln!(
+        "[recovery-default] writing ~{}MB at default Options (memtable_size={}B)...",
+        worst_case_wal_bytes / (1024 * 1024),
+        options.memtable_size
+    );
     {
         let db = rt
             .block_on(Db::open_with(dir.path(), options.clone()))
             .expect("open driftdb");
         rt.block_on(async {
-            load(&db, records, &value, 1000).await;
+            load_random(&db, records, value_size, 500, 0xF00D_0000).await;
         });
-        // Dropped without an explicit close(): each `put`/`write_batch` already waited for its
-        // WAL fsync ack, so the data is durable -- this is exactly the crash-recovery path.
+        // Dropped without an explicit close(): each write_batch already waited for its WAL
+        // fsync ack, so the data is durable -- this is exactly the crash-recovery path.
     }
 
-    eprintln!("[recovery] reopening...");
+    eprintln!("[recovery-default] reopening...");
     let start = Instant::now();
     let db = rt
         .block_on(Db::open_with(dir.path(), options))
@@ -359,19 +461,24 @@ fn bench_recovery_time(rt: &tokio::runtime::Runtime) -> String {
     let elapsed = start.elapsed();
     rt.block_on(db.close()).ok();
 
-    format!("| recovery time (~{recovery_mb}MB WAL, {records} records) | {elapsed:.2?} |")
+    format!(
+        "| recovery time at default Options (~{}MB worst-case WAL, {records} records) | {elapsed:.2?} |",
+        worst_case_wal_bytes / (1024 * 1024)
+    )
 }
 
 fn main() {
     let rt = multi_thread_rt();
 
-    let rows = vec![
-        bench_write_throughput(&rt),
-        bench_ycsb_c_latency(&rt),
-        bench_compaction_storm(&rt),
-        bench_write_amplification(&rt),
-        bench_recovery_time(&rt),
-    ];
+    let mut rows: Vec<String> = WRITE_CONCURRENCY_LEVELS
+        .iter()
+        .map(|&tasks| bench_write_throughput_at(&rt, tasks))
+        .collect();
+    rows.push(bench_ycsb_c_latency(&rt));
+    rows.push(bench_compaction_storm(&rt));
+    rows.push(bench_write_amplification(&rt));
+    rows.push(bench_raw_replay_throughput(&rt));
+    rows.push(bench_recovery_time_default(&rt));
 
     println!("\n# driftdb bench report\n");
     println!("| metric | value |");
