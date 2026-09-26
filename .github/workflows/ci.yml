@@ -17,6 +17,12 @@ jobs:
       fail-fast: false
       matrix:
         rust: [stable, beta]
+    # rust-toolchain.toml pins "stable" at the repo root, which overrides `rustup run`/ambient
+    # toolchain selection for any cargo invocation in this checkout -- without this, the beta
+    # leg of the matrix would silently build and test with stable too. This env var is rustup's
+    # documented override for exactly that file.
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
