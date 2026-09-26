@@ -19,13 +19,20 @@
 //! group-commit throughput scales with how many concurrent callers share one `fdatasync`.
 
 use driftdb::{Db, Options, WriteBatch};
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 /// Concurrency levels the sustained-write-throughput bench reports.
 const WRITE_CONCURRENCY_LEVELS: &[usize] = &[1, 16, 64, 256, 1024];
+
+/// Env var that, when set (to a directory path), tells this binary to act as the recovery-crash
+/// bench's child instead of running the report -- see `run_recovery_crash_child` and
+/// `bench_recovery_crash`.
+const RECOVERY_CHILD_ENV: &str = "DRIFTDB_BENCH_RECOVERY_CHILD";
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -328,25 +335,25 @@ fn bench_compaction_storm(rt: &tokio::runtime::Runtime) -> String {
     )
 }
 
-/// Poll `db.stats()` until per-level byte totals stop changing for a few consecutive polls (or a
-/// generous timeout elapses) -- i.e. wait for the background flush/compaction thread to reach
-/// steady state. Deliberately does *not* force a final `compact()`: that would drive every level
-/// down to the bottom one, which inflates the write-amp number past what a real steady-state
-/// workload (that never runs a manual full compaction) would ever see.
-async fn wait_for_compaction_to_settle(db: &Db) {
-    let mut stable_polls = 0u32;
-    let mut last = db.stats().level_bytes;
+/// Poll `db.stats().background_idle` until the background flush/compaction thread reports
+/// nothing left to do (or a generous timeout elapses) -- i.e. wait for steady state. Deliberately
+/// does *not* force a final `compact()`: that would drive every level down to the bottom one,
+/// which inflates the write-amp number past what a real steady-state workload (that never runs a
+/// manual full compaction) would ever see.
+///
+/// This used to poll `level_bytes` for a few consecutive unchanged samples instead, which can't
+/// tell "actually done" apart from "between two compactions that happen to land on the same byte
+/// totals" -- `background_idle` is exact (no immutables, not mid-flush/mid-compact, and
+/// `compaction::pick` finds nothing), so one confirming poll is enough.
+async fn wait_for_compaction_to_settle(db: &Db) -> bool {
     let deadline = Instant::now() + Duration::from_secs(120);
-    while stable_polls < 5 && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let cur = db.stats().level_bytes;
-        if cur == last {
-            stable_polls += 1;
-        } else {
-            stable_polls = 0;
-            last = cur;
+    while Instant::now() < deadline {
+        if db.stats().background_idle {
+            return true;
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    false
 }
 
 /// Write amplification, RocksDB-style: `(WAL + flush + compaction bytes) / user bytes` (see
@@ -372,16 +379,27 @@ fn bench_write_amplification(rt: &tokio::runtime::Runtime) -> String {
         .expect("open driftdb");
 
     eprintln!("[write-amp] loading ~{load_mb}MB ({records} records, incompressible values)...");
-    rt.block_on(async {
+    let settled = rt.block_on(async {
         load_random(&db, records, value_size, 1000, 0xA5A5_0000).await;
         db.flush().await.expect("flush");
-        wait_for_compaction_to_settle(&db).await;
+        wait_for_compaction_to_settle(&db).await
     });
+    if !settled {
+        eprintln!(
+            "[write-amp] WARNING: background work did not go idle within the deadline -- the \
+             write-amp number below may still include an in-progress flush/compaction"
+        );
+    }
 
     let stats = db.stats();
     rt.block_on(db.close()).ok();
+    let warning = if settled {
+        ""
+    } else {
+        " -- WARNING: hit the settle deadline, see stderr"
+    };
     format!(
-        "| write amplification (~{load_mb}MB loaded, steady state, no forced compact) | {:.2}x (wal {}B, flush+compact {}B, user {}B) -- level files {:?} |",
+        "| write amplification (~{load_mb}MB loaded, steady state, no forced compact; wal bytes include the 21B/record header) | {:.2}x (wal {}B, flush+compact {}B, user {}B) -- level files {:?}{warning} |",
         stats.write_amplification(),
         stats.wal_bytes_written,
         stats.disk_bytes_written,
@@ -425,60 +443,168 @@ fn bench_raw_replay_throughput(_rt: &tokio::runtime::Runtime) -> String {
     )
 }
 
-/// Recovery time at default `Options` -- the realistic worst case, per the bound documented on
-/// `Options::memtable_size`: replay never reads more than `memtable_size * 3` bytes of WAL (the
-/// active memtable plus up to `MAX_IMMUTABLE_MEMTABLES` = 2 queued-but-unflushed frozen ones).
-/// Writes fast enough that the background flush thread can't fully drain ahead of it, so this
-/// approximates (rather than guarantees) actually landing on that bound.
-fn bench_recovery_time_default(rt: &tokio::runtime::Runtime) -> String {
-    let value_size = env_usize("DRIFTDB_BENCH_VALUE_SIZE", 100);
-    let options = Options::default();
-    let worst_case_wal_bytes = options.memtable_size * 3;
-    let records = worst_case_wal_bytes / approx_record_bytes(value_size);
-
-    let dir = TempDir::new().expect("tempdir");
-    eprintln!(
-        "[recovery-default] writing ~{}MB at default Options (memtable_size={}B)...",
-        worst_case_wal_bytes / (1024 * 1024),
-        options.memtable_size
-    );
-    {
-        let db = rt
-            .block_on(Db::open_with(dir.path(), options.clone()))
-            .expect("open driftdb");
-        rt.block_on(async {
-            load_random(&db, records, value_size, 500, 0xF00D_0000).await;
-        });
-        // Dropped without an explicit close(): each write_batch already waited for its WAL
-        // fsync ack, so the data is durable -- this is exactly the crash-recovery path.
+/// `Options` for the recovery-crash bench: a small `memtable_size` so rotation (and therefore
+/// frozen-but-unflushed memtables) happens often under sustained load, without needing gigabytes
+/// of data to get there.
+fn recovery_crash_options() -> Options {
+    Options {
+        memtable_size: 256 * 1024,
+        target_file_size: 128 * 1024,
+        l1_max_bytes: 512 * 1024,
+        l0_compaction_trigger: 4,
+        level_multiplier: 4,
+        max_levels: 5,
+        commit_window: Duration::ZERO,
     }
+}
 
-    eprintln!("[recovery-default] reopening...");
+/// Child entry point for the recovery-crash bench (dispatched from `main` when
+/// `RECOVERY_CHILD_ENV` is set -- see `bench_recovery_crash`). Opens the db at `dir` and hammers
+/// it with concurrent writers forever, printing one line per acked write (flushed immediately)
+/// so the parent can tell it's making progress. Never returns on its own -- the parent SIGKILLs
+/// it once enough memtables have had a chance to freeze.
+fn run_recovery_crash_child(dir: &str) {
+    let value_size = env_usize("DRIFTDB_BENCH_VALUE_SIZE", 100);
+    let rt = multi_thread_rt();
+    rt.block_on(async {
+        let db = Db::open_with(dir, recovery_crash_options())
+            .await
+            .expect("recovery-crash child: open");
+        let mut set = tokio::task::JoinSet::new();
+        for w in 0..8usize {
+            let db = db.clone();
+            set.spawn(async move {
+                let mut rng = Xorshift64::new(0xC0DE_0000 ^ w as u64);
+                let mut value = vec![0u8; value_size];
+                let mut i = 0usize;
+                loop {
+                    rng.fill(&mut value);
+                    let k = format!("rk{w:02}-{i:010}");
+                    if db.put(k.as_bytes(), &value).await.is_err() {
+                        return; // engine already gone -- fine, the kill can land anywhere.
+                    }
+                    let mut out = std::io::stdout().lock();
+                    let _ = writeln!(out, "{w} {i}");
+                    let _ = out.flush();
+                    i += 1;
+                }
+            });
+        }
+        while set.join_next().await.is_some() {}
+    });
+}
+
+/// Real `kill -9` recovery bench: re-execs this same binary (like `tests/crash_kill.rs`) as a
+/// child that writes continuously against a tiny `memtable_size`, gives it just long enough to
+/// pile up several frozen-but-unflushed memtables, then SIGKILLs it -- no graceful shutdown, no
+/// chance for the background thread's shutdown-drain loop to flush anything away first. That
+/// drain loop is exactly why a plain "write then drop `Db`" bench (the previous version of this
+/// row) doesn't measure real crash recovery: `Drop` still joins the background thread, which
+/// flushes every frozen memtable to an SST before returning, so replay on the next open never
+/// sees more than the still-active memtable's WAL. Only an actual `kill -9` skips that.
+///
+/// Reports the wall-clock time for `Db::open` in the parent to finish (replay + re-flush of
+/// whatever survived) and the total bytes of `wal-*.log` on disk right before that open, which is
+/// exactly what gets replayed.
+fn bench_recovery_crash(rt: &tokio::runtime::Runtime) -> String {
+    let dir = TempDir::new().expect("tempdir");
+    let path = dir.path().to_path_buf();
+
+    let exe = std::env::current_exe().expect("current_exe");
+    eprintln!("[recovery-crash] spawning child, writing until kill -9...");
+    let mut child = Command::new(&exe)
+        .env(RECOVERY_CHILD_ENV, &path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn recovery-crash child");
+
+    let stdout = child.stdout.take().expect("child stdout");
+    let (tx, rx) = mpsc::channel::<()>();
+    let reader_handle = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break, // child exited / pipe closed.
+                Ok(_) => {
+                    if tx.send(()).is_err() {
+                        break; // parent stopped listening.
+                    }
+                }
+            }
+        }
+    });
+
+    // Wait for the first acked write separately from the run window: process spawn + tokio
+    // runtime init + the first WAL fsync can take a while on a loaded machine, and that startup
+    // latency shouldn't eat into the window meant for actually piling up frozen memtables.
+    let startup_deadline = Instant::now() + Duration::from_secs(5);
+    let _ = rx.recv_timeout(startup_deadline.saturating_duration_since(Instant::now()));
+    // With memtable_size=256KiB and 8 concurrent writers, this is comfortably enough wall time
+    // to rotate past `MAX_IMMUTABLE_MEMTABLES` several times over and have the writer thread
+    // stalled waiting on the (by-then-dead) background flush thread -- i.e. several WAL
+    // generations sitting unflushed at kill time, not just the active one.
+    std::thread::sleep(Duration::from_millis(750));
+
+    // Ignore the error: if the child somehow already exited on its own, `kill` fails with
+    // `InvalidInput` and there's nothing left to kill anyway.
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = reader_handle.join();
+
+    let wal_bytes_before_open: u64 = std::fs::read_dir(&path)
+        .expect("read_dir")
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("wal-") && n.ends_with(".log"))
+        })
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum();
+
+    eprintln!("[recovery-crash] killed; {wal_bytes_before_open}B of WAL on disk, reopening...");
     let start = Instant::now();
     let db = rt
-        .block_on(Db::open_with(dir.path(), options))
-        .expect("reopen driftdb");
+        .block_on(Db::open_with(&path, recovery_crash_options()))
+        .expect("reopen after kill -9 must succeed");
     let elapsed = start.elapsed();
     rt.block_on(db.close()).ok();
 
     format!(
-        "| recovery time at default Options (~{}MB worst-case WAL, {records} records) | {elapsed:.2?} |",
-        worst_case_wal_bytes / (1024 * 1024)
+        "| recovery time after kill -9 ({wal_bytes_before_open}B of WAL replayed, incl. 21B/record header) | {elapsed:.2?} |"
     )
 }
 
 fn main() {
+    if let Ok(dir) = std::env::var(RECOVERY_CHILD_ENV) {
+        run_recovery_crash_child(&dir);
+        return;
+    }
     let rt = multi_thread_rt();
 
-    let mut rows: Vec<String> = WRITE_CONCURRENCY_LEVELS
-        .iter()
-        .map(|&tasks| bench_write_throughput_at(&rt, tasks))
-        .collect();
-    rows.push(bench_ycsb_c_latency(&rt));
+    // YCSB-C runs first, on its own fresh `Db`/tempdir, before any of the write-throughput
+    // sweeps below (which push tens of thousands of ops through five concurrency levels,
+    // including 1024 concurrent tasks) or the other benches. A prior p99 regression (38us ->
+    // 1.29ms between runs) couldn't be reproduced in isolation here -- with the block cache in
+    // place or removed, p99 stayed in the 80-190us range at both 16 and 64 concurrent readers --
+    // so it looks like it was noise from whatever ran immediately before YCSB-C in that
+    // particular run (allocator/page-cache pressure, tokio worker-thread churn from the
+    // concurrency sweep, ...) rather than a defect in the read path itself. Running it first
+    // removes that confound for future measurements instead of leaving it to guess at.
+    let mut rows: Vec<String> = vec![bench_ycsb_c_latency(&rt)];
+    rows.extend(
+        WRITE_CONCURRENCY_LEVELS
+            .iter()
+            .map(|&tasks| bench_write_throughput_at(&rt, tasks)),
+    );
     rows.push(bench_compaction_storm(&rt));
     rows.push(bench_write_amplification(&rt));
     rows.push(bench_raw_replay_throughput(&rt));
-    rows.push(bench_recovery_time_default(&rt));
+    rows.push(bench_recovery_crash(&rt));
 
     println!("\n# driftdb bench report\n");
     println!("| metric | value |");
