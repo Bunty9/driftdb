@@ -427,7 +427,7 @@ mod tests {
         // buffered entries precede it" contract, `src_a`'s entry is never yielded either: the
         // stream just errors then ends.
         let good = vec![Ok(put("a", 1, "a1"))];
-        let bad: Vec<Result<Entry>> = vec![Err(Error::WalCorrupt("boom".into()))];
+        let bad: Vec<Result<Entry>> = vec![Err(Error::SstCorrupt("boom".into()))];
         let src_a: BoxIter<'_> = Box::new(good.into_iter());
         let src_b: BoxIter<'_> = Box::new(bad.into_iter());
         let mut it = merge(vec![src_a, src_b]);
@@ -444,7 +444,7 @@ mod tests {
         // entries strictly before the failure, then the error, then end — and must never reach
         // "c".
         let a: Vec<Result<Entry>> =
-            vec![Ok(put("a", 5, "a5")), Err(Error::WalCorrupt("boom".into()))];
+            vec![Ok(put("a", 5, "a5")), Err(Error::SstCorrupt("boom".into()))];
         let b: Vec<Result<Entry>> = vec![Ok(put("b", 1, "b1")), Ok(put("c", 1, "c1"))];
         let src_a: BoxIter<'_> = Box::new(a.into_iter());
         let src_b: BoxIter<'_> = Box::new(b.into_iter());
@@ -560,7 +560,7 @@ mod tests {
     #[test]
     fn compaction_filter_error_propagates_after_resolved_entries() {
         let mut items: Vec<Result<Entry>> = vec![Ok(put("a", 5, "a5")), Ok(put("a", 1, "a1"))];
-        items.push(Err(Error::WalCorrupt("boom".into())));
+        items.push(Err(Error::SstCorrupt("boom".into())));
         let src: BoxIter<'_> = Box::new(items.into_iter());
         let mut it = compaction_filter(src, 10, false);
         // seq 5 and seq 1 are both > nothing... oldest_snapshot=10 means both <=10; first (seq

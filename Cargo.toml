@@ -10,8 +10,13 @@ categories = ["database-implementations"]
 readme = "README.md"
 
 [dependencies]
-# Async runtime — used for the WAL writer task, compactor task, and group-commit timer.
-tokio = { version = "1.47", features = ["sync", "rt", "macros", "time", "fs"] }
+# Not the execution model here — the WAL writer and background flush/compaction threads are
+# plain `std::thread`s, and `fdatasync`/group-commit run on them directly. tokio is only used
+# for the `oneshot` ack channel between callers and the writer thread, and `spawn_blocking` to
+# run that blocking work off of a caller's async task (`Db::open`, `scan`, `flush`, `compact`,
+# `close`). Kept to just the features that cover that: "rt" for `spawn_blocking`, "sync" for
+# `oneshot`.
+tokio = { version = "1.47", features = ["sync", "rt"] }
 
 # Concurrent memtable (lock-free skiplist) — the canonical pick from `backend-cloud-roadmap.md` § 3.
 crossbeam-skiplist = "0.1"

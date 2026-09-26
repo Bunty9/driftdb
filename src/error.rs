@@ -2,23 +2,22 @@
 //!
 //! The crate uses `thiserror` for the library surface so callers can pattern-match on
 //! variants. The boundary contract: I/O errors (`std::io::Error`) and bincode serialization
-//! errors (`bincode::Error`) are wrapped through `#[from]`. Anything that indicates on-disk
-//! corruption — a bad WAL CRC or a malformed manifest record — surfaces as a `WalCorrupt` or
-//! `ManifestCorrupt` variant with a human-readable message.
+//! errors (`bincode::Error`) are wrapped through `#[from]`. WAL corruption is *not* one of
+//! those variants: a bad CRC, an invalid kind byte, or a header/body that runs off the end of
+//! the file is always treated as a torn tail from a mid-write crash (see `wal.rs`'s module
+//! docs) and silently truncated away on replay rather than surfaced as an error. Manifest
+//! corruption gets the stricter treatment — a `ManifestCorrupt` variant — because only a torn
+//! *tail* frame is dropped that way; the same corruption in the middle of the log is a real
+//! error (see `manifest.rs`'s module docs).
 
 use thiserror::Error;
 
 /// Crate-wide error type. See module docs for the full taxonomy.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// Underlying filesystem error from `std::io` or `tokio::fs`.
+    /// Underlying filesystem error from `std::io`.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-
-    /// WAL record failed checksum validation, ran off the end of the file mid-record, or had
-    /// a length prefix that exceeded the configured limit.
-    #[error("wal corrupt: {0}")]
-    WalCorrupt(String),
 
     /// Manifest log replay encountered an unknown record kind, a truncated record, or a
     /// version mismatch.

@@ -28,9 +28,11 @@ return `crate::Result<T>` unless noted.
   memtable. Callers send `WriteReq { ops, ack: tokio::oneshot }` over a
   `std::sync::mpsc` channel.
 * Group commit = natural batching: block on the first request, drain every
-  request already queued (up to 128), optionally wait up to
-  `Options::commit_window` (default 0) for more, then append all records,
-  one `fdatasync`, insert into the memtable, publish `visible_seq`, ack.
+  request already queued (up to `MAX_BATCH_REQUESTS` = 1024, or however many
+  fit under the remaining `memtable_size` byte budget — whichever limit hits
+  first), optionally wait up to `Options::commit_window` (default 0) for
+  more, then append all records, one `fdatasync`, insert into the memtable,
+  publish `visible_seq`, ack.
 * Reads use `visible_seq` as their snapshot, so they never observe a write
   before it is durable.
 * If `fdatasync` fails the engine is **poisoned**: every pending and future
@@ -152,8 +154,10 @@ impl SstReader {
 ### `manifest.rs`
 
 Log of **edits**; each edit is one frame `[u32 BE len][u32 BE crc32][bincode(Vec<ManifestRecord>)]`
-so a compaction's adds + deletes apply atomically. A torn/corrupt final frame is
-truncated on open.
+so a compaction's adds + deletes apply atomically. A torn/CRC-invalid frame is dropped on
+replay only if it's the tail of the file; the same corruption mid-log is a hard
+`Error::ManifestCorrupt`. Either way, the manifest is rewritten as a single snapshot edit
+(tmp file + fsync + rename) on open, not truncated in place.
 
 ```rust
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,9 +204,10 @@ impl Manifest {
 * Current file set is an immutable `Arc<Version>` swapped under a lock
   (copy-on-write); readers clone the Arc and read without locks.
 * Pick: L0 file count >= trigger → all L0 + overlapping L1. Else first level n>=1
-  with bytes > l1_max_bytes * mult^(n-1) → its oldest-picked file (round-robin
-  by key) + overlapping L_{n+1}. Output split at `target_file_size`, never
-  splitting versions of one user key across files.
+  with bytes > l1_max_bytes * mult^(n-1) → the file with the smallest `smallest`
+  key in that level (not round-robin — see `compaction.rs`'s `pick_inner`) +
+  overlapping L_{n+1}. Output split at `target_file_size`, never splitting
+  versions of one user key across files.
 * `Db` API: `open`, `open_with`, `put`, `delete`, `write_batch`, `get`,
   `snapshot` (RAII; registers seq so compaction keeps its versions),
   `Snapshot::get`, `scan(range)`, `flush`, `compact` (force full compaction),

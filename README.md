@@ -134,8 +134,12 @@ answers you give in the storage-engineering interview.
 
 driftdb runs **leveled** compaction. L0 holds the N most recent
 flushes (may overlap on key range); L1+ are non-overlapping sorted
-runs. Trigger: `|L_n| > base * mult^n`. Pick: oldest L_n SST + all
-overlapping L_{n+1} SSTs → merge → write L_{n+1}.
+runs. Trigger: L0 compacts once it holds `l0_compaction_trigger`
+files; `L_n` (n >= 1) compacts once its total bytes exceed
+`l1_max_bytes * level_multiplier^(n-1)`. Pick: on the L0 path, all of
+L0 + any overlapping L1 files; otherwise the `L_n` file with the
+smallest `smallest` key (a simple round-robin proxy, not recency) +
+all overlapping `L_{n+1}` files → merge → write to `L_{n+1}`.
 
 - **Leveled** gives `O(log N)` reads + low space amp; cost is write
   amplification roughly 5–10×.
@@ -259,9 +263,12 @@ to flush the frozen one. So WAL generation k contains exactly the records of mem
 5. Open a fresh WAL and start background threads.
 
 **Torn-tail policy.** WAL replay stops at EOF, an invalid kind byte, a header/body
-that runs off the end, or a CRC mismatch. Manifest replay stops at a CRC-failed or
-structurally invalid frame (only the tail frame may be torn). Anything past the stop
-point is truncated away on replay.
+that runs off the end, or a CRC mismatch, and truncates away everything from that point on.
+Manifest replay only drops a torn/CRC-invalid frame the same way when it's the very tail of
+the file; the same corruption occurring mid-log (more bytes follow it) is not treated as a
+crash artifact — it's a hard `Error::ManifestCorrupt`. Either way, `Manifest::open` rewrites
+the manifest as a single snapshot edit (tmp file + fsync + rename) rather than truncating the
+existing file in place.
 
 **Crash test.** `tests/crash_kill.rs` spawns a child process, crashes it with `SIGKILL`
 mid-batch, and verifies recovery replays all committed writes.
