@@ -117,6 +117,13 @@ pub struct Stats {
     pub disk_bytes_written: u64,
     /// Bytes written to the WAL (post-fsync, i.e. only what actually reached disk).
     pub wal_bytes_written: u64,
+    /// `true` if the background thread has no frozen memtable to flush, isn't mid-flush or
+    /// mid-compaction right now, and `compaction::pick` finds nothing to do at the current
+    /// version -- i.e. the engine is quiescent as far as background work goes. A benchmark
+    /// polling for "steady state" should use this instead of watching `level_bytes` stop moving:
+    /// that heuristic can't tell "actually done" apart from "between two compactions that happen
+    /// to land on the same byte totals".
+    pub background_idle: bool,
 }
 
 impl Stats {
@@ -216,6 +223,9 @@ struct Inner {
     /// Set by `Db::compact()` while a forced full compaction is in flight; the background
     /// thread's picker consults it to bypass the normal trigger thresholds.
     force_compact: AtomicBool,
+    /// Set by `bg_thread` while it's actually inside `do_flush`/`do_compact` (not just picking
+    /// work or sleeping). Read by `Stats::background_idle`.
+    bg_busy: AtomicBool,
     work_mu: Mutex<()>,
     work_cv: Condvar,
     stall_mu: Mutex<()>,
@@ -846,7 +856,10 @@ fn bg_thread(inner: Arc<Inner>) {
             }
             let oldest = inner.mem.read().immutables.first().cloned();
             if let Some((wal_n, mt)) = oldest {
-                if let Err(e) = inner.do_flush(wal_n, &mt) {
+                inner.bg_busy.store(true, Ordering::Relaxed);
+                let result = inner.do_flush(wal_n, &mt);
+                inner.bg_busy.store(false, Ordering::Relaxed);
+                if let Err(e) = result {
                     tracing::error!("driftdb: flush of wal {wal_n} failed: {e}");
                     *inner.fatal.lock() = Some(format!("flush failed: {e}"));
                     inner.notify_all_waiters();
@@ -861,7 +874,10 @@ fn bg_thread(inner: Arc<Inner>) {
                 compaction::pick(&metas, &inner.options)
             };
             if let Some(plan) = plan {
-                if let Err(e) = inner.do_compact(&plan) {
+                inner.bg_busy.store(true, Ordering::Relaxed);
+                let result = inner.do_compact(&plan);
+                inner.bg_busy.store(false, Ordering::Relaxed);
+                if let Err(e) = result {
                     tracing::error!("driftdb: compaction failed: {e}");
                     *inner.fatal.lock() = Some(format!("compaction failed: {e}"));
                     inner.notify_all_waiters();
@@ -1116,15 +1132,23 @@ impl Db {
             level_files.push(level.len());
             level_bytes.push(level.iter().map(|t| t.meta.size).sum());
         }
-        let memtable_bytes = {
+        let (memtable_bytes, immutables_empty) = {
             let mem = inner.mem.read();
-            mem.active.size() as u64
+            let bytes = mem.active.size() as u64
                 + mem
                     .immutables
                     .iter()
                     .map(|(_, m)| m.size() as u64)
-                    .sum::<u64>()
+                    .sum::<u64>();
+            (bytes, mem.immutables.is_empty())
         };
+        // Best-effort: each of these three checks is a separate, unsynchronized read, so a
+        // background flush/compaction could start or finish between them. That only risks a
+        // stale `true`/`false` for one `stats()` call, never a hang -- callers polling this in a
+        // loop (see `benches/report.rs`) converge on the next poll.
+        let background_idle = immutables_empty
+            && !inner.bg_busy.load(Ordering::Relaxed)
+            && compaction::pick(&version.level_metas(), &inner.options).is_none();
         Stats {
             level_files,
             level_bytes,
@@ -1133,6 +1157,7 @@ impl Db {
             disk_bytes_written: inner.stats.bytes_flushed.load(Ordering::Relaxed)
                 + inner.stats.bytes_compacted.load(Ordering::Relaxed),
             wal_bytes_written: inner.stats.wal_bytes.load(Ordering::Relaxed),
+            background_idle,
         }
     }
 
@@ -1284,6 +1309,7 @@ fn open_sync(dir: &Path, options: Options) -> Result<Db> {
         fatal: Mutex::new(None),
         shutdown: AtomicBool::new(false),
         force_compact: AtomicBool::new(false),
+        bg_busy: AtomicBool::new(false),
         work_mu: Mutex::new(()),
         work_cv: Condvar::new(),
         stall_mu: Mutex::new(()),
