@@ -33,6 +33,12 @@ use std::time::Duration;
 #[derive(Clone, Debug)]
 pub struct Options {
     /// Freeze the active memtable and roll to a new WAL once its approximate size reaches this.
+    ///
+    /// This also bounds recovery time: replay on reopen never reads more than
+    /// `memtable_size * (1 + MAX_IMMUTABLE_MEMTABLES)` bytes of WAL (the active memtable plus
+    /// however many frozen-but-unflushed ones `rotate` allows to queue -- see
+    /// `MAX_IMMUTABLE_MEMTABLES` in `db.rs`), since anything older has already been flushed to
+    /// an SST and its WAL deleted.
     pub memtable_size: usize,
     /// Compact all of L0 (+ overlapping L1) once L0 holds at least this many files.
     pub l0_compaction_trigger: usize,
@@ -102,16 +108,24 @@ pub struct Stats {
     pub level_bytes: Vec<u64>,
     pub memtable_bytes: u64,
     pub user_bytes_written: u64,
+    /// Bytes written to SST files by flushes and compactions combined (not the WAL -- see
+    /// [`Stats::wal_bytes_written`]).
     pub disk_bytes_written: u64,
+    /// Bytes written to the WAL (post-fsync, i.e. only what actually reached disk).
+    pub wal_bytes_written: u64,
 }
 
 impl Stats {
-    /// `disk_bytes_written / user_bytes_written`, or `0.0` before anything has been written.
+    /// Write amplification, defined the way RocksDB defines it: `(WAL bytes + flush bytes +
+    /// compaction bytes) / user bytes`. `disk_bytes_written` already sums flush + compaction
+    /// bytes (see `Db::stats`), so this is `(wal_bytes_written + disk_bytes_written) /
+    /// user_bytes_written`, or `0.0` before anything has been written.
     pub fn write_amplification(&self) -> f64 {
         if self.user_bytes_written == 0 {
             0.0
         } else {
-            self.disk_bytes_written as f64 / self.user_bytes_written as f64
+            (self.wal_bytes_written + self.disk_bytes_written) as f64
+                / self.user_bytes_written as f64
         }
     }
 }
@@ -160,6 +174,7 @@ struct MemState {
 #[derive(Default)]
 struct StatsInner {
     user_bytes: AtomicU64,
+    wal_bytes: AtomicU64,
     bytes_flushed: AtomicU64,
     bytes_compacted: AtomicU64,
 }
@@ -575,10 +590,17 @@ fn as_option(v: Value) -> Option<Vec<u8>> {
     }
 }
 
+/// How many frozen memtables `rotate` lets pile up (waiting on the background flush thread)
+/// before it stalls new writes. This is also the recovery-time bound: on crash, the WAL holds at
+/// most the active memtable plus this many frozen-but-unflushed ones, so replay on reopen never
+/// has more than `Options::memtable_size * (1 + MAX_IMMUTABLE_MEMTABLES)` bytes of WAL to read --
+/// see `Options::memtable_size`'s doc comment.
+const MAX_IMMUTABLE_MEMTABLES: usize = 2;
+
 /// Freeze the active memtable and open a fresh WAL, stalling (respecting shutdown/fatal) while
-/// 2+ frozen memtables are already waiting on the background thread. Returns the WAL number the
-/// just-frozen memtable is tagged with, or `None` if the active memtable was empty. Only ever
-/// called from the writer thread.
+/// `MAX_IMMUTABLE_MEMTABLES` frozen memtables are already waiting on the background thread.
+/// Returns the WAL number the just-frozen memtable is tagged with, or `None` if the active
+/// memtable was empty. Only ever called from the writer thread.
 fn rotate(inner: &Inner, wal: &mut WalFile) -> Result<Option<u64>> {
     {
         let mem = inner.mem.read();
@@ -590,12 +612,12 @@ fn rotate(inner: &Inner, wal: &mut WalFile) -> Result<Option<u64>> {
         }
     }
     loop {
-        if inner.mem.read().immutables.len() < 2 {
+        if inner.mem.read().immutables.len() < MAX_IMMUTABLE_MEMTABLES {
             break;
         }
         inner.check_fatal()?;
         let mut g = inner.stall_mu.lock();
-        if inner.mem.read().immutables.len() >= 2 {
+        if inner.mem.read().immutables.len() >= MAX_IMMUTABLE_MEMTABLES {
             inner.stall_cv.wait_for(&mut g, Duration::from_millis(50));
         }
     }
@@ -620,6 +642,13 @@ fn fail_rotate(ack: tokio::sync::oneshot::Sender<Result<Option<u64>>>, msg: &str
     let _ = ack.send(Err(Error::Io(std::io::Error::other(msg.to_string()))));
 }
 
+/// Cap on requests drained into one group-commit batch. Higher pays off under heavy concurrency
+/// (more puts amortized over one `fdatasync`); it costs nothing at low concurrency since
+/// `rx.try_recv()` simply returns empty once the queue is drained, so this is sized for the
+/// high end (hundreds to low thousands of concurrent callers) rather than split into a separate
+/// low-concurrency tier.
+const MAX_BATCH_REQUESTS: usize = 1024;
+
 /// The single writer thread: owns the current WAL file, batches requests via group commit, and
 /// is the only place that ever appends to `mem.active` or freezes it into `mem.immutables`.
 fn writer_thread(inner: Arc<Inner>, rx: mpsc::Receiver<Req>, mut wal: WalFile) {
@@ -629,7 +658,7 @@ fn writer_thread(inner: Arc<Inner>, rx: mpsc::Receiver<Req>, mut wal: WalFile) {
             Err(_) => break, // every Sender dropped -- shut down.
         };
         let mut batch = vec![first];
-        while batch.len() < 128 {
+        while batch.len() < MAX_BATCH_REQUESTS {
             match rx.try_recv() {
                 Ok(r) => batch.push(r),
                 Err(_) => break,
@@ -637,7 +666,7 @@ fn writer_thread(inner: Arc<Inner>, rx: mpsc::Receiver<Req>, mut wal: WalFile) {
         }
         if !inner.options.commit_window.is_zero() {
             let deadline = std::time::Instant::now() + inner.options.commit_window;
-            while batch.len() < 128 {
+            while batch.len() < MAX_BATCH_REQUESTS {
                 let now = std::time::Instant::now();
                 if now >= deadline {
                     break;
@@ -693,6 +722,7 @@ fn writer_thread(inner: Arc<Inner>, rx: mpsc::Receiver<Req>, mut wal: WalFile) {
                     let _ = ack.send(Ok(s));
                 }
             } else {
+                let wal_bytes = wal.pending_len();
                 match wal.sync() {
                     Ok(()) => {
                         let active = inner.mem.read().active.clone();
@@ -704,6 +734,10 @@ fn writer_thread(inner: Arc<Inner>, rx: mpsc::Receiver<Req>, mut wal: WalFile) {
                             .stats
                             .user_bytes
                             .fetch_add(user_bytes, Ordering::Relaxed);
+                        inner
+                            .stats
+                            .wal_bytes
+                            .fetch_add(wal_bytes, Ordering::Relaxed);
                         for (ack, s) in acks {
                             let _ = ack.send(Ok(s));
                         }
@@ -1005,6 +1039,7 @@ impl Db {
             user_bytes_written: inner.stats.user_bytes.load(Ordering::Relaxed),
             disk_bytes_written: inner.stats.bytes_flushed.load(Ordering::Relaxed)
                 + inner.stats.bytes_compacted.load(Ordering::Relaxed),
+            wal_bytes_written: inner.stats.wal_bytes.load(Ordering::Relaxed),
         }
     }
 
