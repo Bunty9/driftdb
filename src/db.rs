@@ -276,17 +276,22 @@ impl Inner {
     }
 
     /// Unregister a read view previously returned by [`Inner::register_snapshot`].
+    ///
+    /// No `notify_all_waiters()` here: `stall_cv` is only waited on by `rotate` (for
+    /// `mem.immutables` shrinking, which only `do_flush` changes) and `flush_cv` only by
+    /// `wait_flushed`/`compact_blocking` (for a flush/compaction actually finishing, which
+    /// `do_flush`/`do_compact` already notify on). Nothing ever blocks on a condvar waiting for
+    /// the *snapshot table* to shrink -- `do_compact` just reads `oldest_snapshot()` once, it
+    /// doesn't wait for it to advance -- so broadcasting on every `get`/`scan` unregister (i.e.
+    /// on every read) was pure overhead.
     fn unregister_snapshot(&self, seq: u64) {
-        {
-            let mut snapshots = self.snapshots.lock();
-            if let Some(count) = snapshots.get_mut(&seq) {
-                *count -= 1;
-                if *count == 0 {
-                    snapshots.remove(&seq);
-                }
+        let mut snapshots = self.snapshots.lock();
+        if let Some(count) = snapshots.get_mut(&seq) {
+            *count -= 1;
+            if *count == 0 {
+                snapshots.remove(&seq);
             }
         }
-        self.notify_all_waiters();
     }
 
     fn oldest_snapshot(&self) -> u64 {
@@ -1038,6 +1043,18 @@ impl Db {
     /// Latest-version read. Registers a short-lived snapshot for the duration of the read so a
     /// concurrent compaction can't drop the version this call is in the middle of reading (see
     /// `Inner::register_snapshot`).
+    ///
+    /// The registration itself is kept (only the redundant condvar notify on unregister was
+    /// removed -- see `Inner::unregister_snapshot`): once `get_at` has cloned the active/frozen
+    /// memtable `Arc`s and the `Version` `Arc`, a *later* compaction genuinely can't take data
+    /// away from this call (SSTs are immutable and `do_compact`/`do_flush` only ever install a
+    /// new `Version`, never mutate an existing `Table` in place). But between this call
+    /// registering `seq` and `get_at` actually taking those clones, an *already in-flight*
+    /// compaction could otherwise install a version that already dropped a pre-`seq` entry this
+    /// read needs (it computes `oldest_snapshot()` -- the floor below which it's safe to GC old
+    /// versions/tombstones -- from the same `snapshots` map). Registering first closes that
+    /// window: `oldest_snapshot()` can never be computed as newer than a `seq` that's already
+    /// registered. Dropping registration entirely would reopen it, so it stays.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let inner = &self.guard.inner;
         let seq = inner.register_snapshot();
