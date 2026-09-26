@@ -371,7 +371,7 @@ driftdb/
     crash_kill.rs      SIGKILL a writer child process, verify every acked write
   benches/          report.rs, throughput.rs, ycsb.rs
   examples/         quickstart.rs
-  docs/             design spec, phase plans (phase-2 plan = module contracts)
+  docs/             ARCHITECTURE.md (internals guide), design spec, phase plans
 ```
 
 ## Roadmap
