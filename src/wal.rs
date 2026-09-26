@@ -32,7 +32,7 @@
 
 use crate::memtable::Value;
 use crate::Result;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -131,6 +131,10 @@ impl WalFile {
     ///
     /// Debug-only sanity check against [`MAX_KEY_LEN`]/[`MAX_VALUE_LEN`] — enforcement lives in
     /// `Db`, which rejects oversized inputs before they get here.
+    ///
+    /// ponytail: writes straight into `self.buf` (reserving space for the CRC, then hashing the
+    /// body slice in place) instead of building a separate `Vec` per record and copying it in --
+    /// one fewer allocation and one fewer memcpy per write on the hot path.
     pub fn append(&mut self, seq: u64, key: &[u8], val: &Value) {
         let (kind, val_bytes): (u8, &[u8]) = match val {
             Value::Put(v) => (KIND_PUT, v.as_slice()),
@@ -146,18 +150,22 @@ impl WalFile {
             "WalFile::append: value length {} exceeds MAX_VALUE_LEN ({MAX_VALUE_LEN}); Db must reject this before it reaches the WAL",
             val_bytes.len()
         );
-        let body_len = 8 + 1 + 4 + 4 + key.len() + val_bytes.len();
-        let mut body = Vec::with_capacity(body_len);
-        body.extend_from_slice(&seq.to_be_bytes());
-        body.push(kind);
-        body.extend_from_slice(&(key.len() as u32).to_be_bytes());
-        body.extend_from_slice(&(val_bytes.len() as u32).to_be_bytes());
-        body.extend_from_slice(key);
-        body.extend_from_slice(val_bytes);
+        let record_len = HEADER_LEN + key.len() + val_bytes.len();
+        self.buf.reserve(record_len);
+        let crc_pos = self.buf.len();
+        self.buf.extend_from_slice(&[0u8; 4]); // placeholder, patched below
+        let body_start = self.buf.len();
+        self.buf.extend_from_slice(&seq.to_be_bytes());
+        self.buf.push(kind);
+        self.buf
+            .extend_from_slice(&(key.len() as u32).to_be_bytes());
+        self.buf
+            .extend_from_slice(&(val_bytes.len() as u32).to_be_bytes());
+        self.buf.extend_from_slice(key);
+        self.buf.extend_from_slice(val_bytes);
 
-        let crc = crc32fast::hash(&body);
-        self.buf.extend_from_slice(&crc.to_be_bytes());
-        self.buf.extend_from_slice(&body);
+        let crc = crc32fast::hash(&self.buf[body_start..]);
+        self.buf[crc_pos..crc_pos + 4].copy_from_slice(&crc.to_be_bytes());
     }
 
     /// Write the buffered records and `fdatasync` the file. Checks the syscall's return value
@@ -189,6 +197,13 @@ impl WalFile {
     pub fn size(&self) -> u64 {
         self.synced_len + self.buf.len() as u64
     }
+
+    /// Bytes currently buffered, not yet synced -- i.e. exactly what the next `sync()` call will
+    /// write. Used by the caller to attribute those bytes to write-amplification accounting
+    /// right before calling `sync`.
+    pub fn pending_len(&self) -> u64 {
+        self.buf.len() as u64
+    }
 }
 
 /// Replay every valid record in `path`, calling `f(seq, key, val)` for each in file order.
@@ -198,13 +213,25 @@ impl WalFile {
 /// anything was dropped, the file is truncated to the last good offset and fsynced so a future
 /// `append` starts clean. Returns the maximum seqno seen, or `0` if the file was empty (or every
 /// record was torn).
+///
+/// ponytail: reads the file via `mmap` (like `SstReader`) instead of `read_to_end` into a fresh
+/// `Vec` -- one less full-file copy off the page cache before decoding even starts. The
+/// per-record `key`/`value` copies below stay: the memtable owns its keys/values, so something
+/// has to allocate them eventually.
 pub fn replay(path: &Path, mut f: impl FnMut(u64, Vec<u8>, Value)) -> Result<u64> {
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
+    let total_len = file.metadata()?.len() as usize;
+    if total_len == 0 {
+        return Ok(0);
+    }
+    // Safety: this file was just opened by this call and nothing else concurrently writes to a
+    // WAL file mid-replay (replay only ever runs during recovery, before the writer thread for
+    // this generation exists).
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let data: &[u8] = &mmap;
 
     let mut offset = 0usize;
     let mut max_seq = 0u64;
@@ -257,7 +284,9 @@ pub fn replay(path: &Path, mut f: impl FnMut(u64, Vec<u8>, Value)) -> Result<u64
         offset = val_end;
     }
 
-    if offset < data.len() {
+    let need_truncate = offset < data.len();
+    drop(mmap); // must not touch `data` (borrowed from it) past this point.
+    if need_truncate {
         file.set_len(offset as u64)?;
         file.sync_all()?;
     }
