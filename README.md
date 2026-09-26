@@ -6,7 +6,7 @@
 > roadmap — the canonical interview pitch: _"I wanted to understand
 > fsync semantics, so I wrote my own LSM."_
 
-[![ci](https://img.shields.io/badge/ci-passing-green.svg)](https://github.com/Bunty9/driftdb/actions/workflows/ci.yml)
+[![ci](https://github.com/Bunty9/driftdb/actions/workflows/ci.yml/badge.svg)](https://github.com/Bunty9/driftdb/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/badge/crates.io-pending-lightgrey.svg)](#)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
@@ -18,7 +18,7 @@ compaction — is the canonical storage-engineering interview project.
 **driftdb** is that engine, sized to embed into the other roadmap
 projects (rustyq job-queue metadata, agent state, edge-runtime
 checkpoints) and to ship as a public crate with reproducible
-YCSB-style benchmarks against RocksDB.
+YCSB-style benchmarks.
 
 ## Architecture
 
@@ -34,7 +34,7 @@ YCSB-style benchmarks against RocksDB.
                 |                                       l1.get(k) --> bloom filter --> block read
                 | size > threshold                      ...
                 v
-        freeze memtable (arc-swap)
+        freeze memtable (new WAL file)
                 |
                 v
         new memtable starts taking writes
@@ -190,26 +190,47 @@ bincode-encoded.
 
 ## Benchmarks
 
-| Metric                                                | Target            | Current |
-| ----------------------------------------------------- | ----------------- | --------|
-| Write amplification (leveled)                         | 5–10×             |         |
-| p99 read latency during compaction storm              | < 10 ms           |         |
-| Recovery on 10 GB WAL                                 | < 5 s             |         |
-| Sustained write throughput (4 vCPU, group-commit WAL) | > 50,000 writes/s |         |
-| YCSB-C (100% read) p99 vs RocksDB                     | within 2×         |         |
+Measured with `cargo bench --bench report` (release, default sizes) on an
+8-thread Intel i5-9300H laptop with a consumer NVMe SSD (ext4), on a shared,
+not-idle machine. Values are 100 B incompressible random bytes. Treat these
+as order-of-magnitude numbers, not a lab result.
 
-_Numbers pending — see `cargo bench --bench report`_
+| Metric                                         | Target            | Measured |
+| ---------------------------------------------- | ----------------- | -------- |
+| Sustained write throughput (group commit)      | > 50,000 writes/s | 93,800 writes/s at 1,024 concurrent writers |
+| Write amplification (leveled, steady state)    | 5–10×             | 5.2× (WAL + flush + compaction bytes / user bytes, ~200 MB loaded, 4 levels populated) |
+| p99 read latency during compaction storm       | < 10 ms           | 14 µs |
+| YCSB-C get latency (Zipfian, 20k records)      | —                 | p50 15 µs, p99 169 µs, p999 704 µs |
+| WAL replay throughput                          | —                 | ~2.4 GB/s (mmap replay, 180k records) |
+| Recovery after `kill -9`                       | < 5 s             | 9 ms (WAL replay is bounded, see below) |
 
-Run benchmarks:
+Write throughput against concurrency shows group commit at work. Every ack
+waits for an `fdatasync`, so throughput is about batch size divided by fsync
+latency:
+
+| concurrent writers | 1   | 16    | 64     | 256    | 1,024  |
+| ------------------ | --- | ----- | ------ | ------ | ------ |
+| writes/s           | 399 | 2,886 | 11,590 | 41,140 | 93,828 |
+
+**Recovery is bounded by design, not by replay speed.** Each memtable owns
+one WAL file, and the writer stalls while two frozen memtables are waiting to
+flush. So a crash leaves at most about `memtable_size × 3` of WAL to replay,
+plus one group-commit batch per memtable. That is about 12 MiB with the
+default options, and the WAL can never grow to gigabytes. The original
+"10 GB WAL in < 5 s" target does not arise with this design.
+
+No RocksDB comparison has been run yet; see `PROGRESS.md`.
+
+Run the benchmarks:
 
 ```bash
-cargo bench --bench throughput      # 100k random puts
-cargo bench --bench ycsb            # YCSB A/B/C/F workloads
-cargo bench --bench report          # comprehensive report vs RocksDB
+cargo bench --bench report       # one-shot markdown table (the numbers above)
+cargo bench --bench throughput   # criterion: concurrent puts, write_batch, sequential puts
+cargo bench --bench ycsb         # criterion: YCSB A/B/C/F with a Zipfian key chooser
 ```
 
-Set environment variables to customize the report run (see `benches/report.rs` header
-for available knobs: dataset size, YCSB distribution, concurrency, etc.).
+`benches/report.rs` reads `DRIFTDB_BENCH_*` environment variables to scale
+the run up or down; they are listed in the file header.
 
 ## Durability & recovery
 
@@ -227,7 +248,7 @@ write fails with an error (fsyncgate — a failed fsync cannot be safely retried
 kernel gives no guarantee the dirty pages are still queued).
 
 **One WAL per memtable.** When the active memtable crosses the size threshold, the
-writer freezes it (arc-swap), opens a fresh WAL, and signals the background thread
+writer freezes it, opens a fresh WAL, and signals the background thread
 to flush the frozen one. So WAL generation k contains exactly the records of memtable k.
 
 **Recovery steps** (on `Db::open`):
@@ -259,10 +280,8 @@ use driftdb::{Db, Options, WriteBatch};
 
 #[tokio::main]
 async fn main() -> driftdb::Result<()> {
-    // Open with default options (4 MiB memtable, 10 MiB L1, etc.)
-    let db = Db::open("/var/lib/myapp/driftdb").await?;
-
-    // Tunable options
+    // `Db::open(path)` uses `Options::default()` (4 MiB memtable, 10 MiB L1, ...).
+    // Only one `Db` may hold a directory at a time (flock on `LOCK`).
     let opts = Options {
         memtable_size: 8 * 1024 * 1024,  // 8 MiB
         l0_compaction_trigger: 4,
@@ -289,8 +308,9 @@ async fn main() -> driftdb::Result<()> {
 
     // Snapshot: point-in-time read view (prevents GC of older versions)
     let snap = db.snapshot();
-    let val = snap.get(b"k1")?;
-    let range = snap.scan(b"k".to_vec()..b"l".to_vec())?;
+    let old_k1 = snap.get(b"k1")?;
+    let old_range = snap.scan(b"k".to_vec()..b"l".to_vec())?;
+    println!("{old_k1:?} {}", old_range.len());
     drop(snap);  // unregisters and allows GC
 
     // Range scan at the current visible seqno
@@ -327,33 +347,24 @@ cargo run --example quickstart
 
 ```
 driftdb/
-  Cargo.toml                # single-crate library
   src/
-    lib.rs                  # public re-exports
-    db.rs                   # `Db` handle, open/put/get/delete/snapshot
-    wal.rs                  # group-commit WAL writer
-    memtable.rs             # crossbeam-skiplist memtable + MVCC keys
-    sstable.rs              # SST writer + (Phase 2) reader
-    manifest.rs             # append-only manifest log
-    compaction.rs           # leveled compaction scheduler skeleton
-    error.rs                # thiserror surface
-  benches/
-    throughput.rs           # 100k random puts (memtable-only path)
-    ycsb.rs                 # YCSB A/B/C/F workload harness
-    report.rs               # comprehensive report vs RocksDB
-  examples/
-    quickstart.rs           # put + get round-trip
+    lib.rs          public re-exports + crate docs
+    db.rs           Db handle: writer thread (group commit), background flush/compaction
+                    thread, recovery, MVCC reads, snapshots, scans, stats
+    wal.rs          WAL record codec, WalFile (buffered append + fdatasync), torn-tail replay
+    memtable.rs     crossbeam-skiplist memtable keyed by (user_key, seqno DESC)
+    sstable.rs      SST writer + mmap reader (bloom, index, per-table block cache)
+    manifest.rs     append-only manifest of atomic edits, rewritten on open
+    compaction.rs   leveled compaction picker + executor
+    iter.rs         k-way merge, MVCC visibility filter, compaction GC filter
+    error.rs        thiserror error type
   tests/
-    crash_recovery.rs       # reopen-after-drop integration test
-    crash_kill.rs           # SIGKILL durability test
-    engine.rs               # test utilities
-  docs/
-    specs/2026-05-28-driftdb-design.md         # full design spec
-    plans/2026-05-28-driftdb-phase-1-scaffold.md
-  deny.toml                 # cargo-deny config
-  rust-toolchain.toml       # stable channel
-  .github/workflows/ci.yml  # fmt + clippy + nextest + deny + bench
-  PROGRESS.md               # per-sprint tracker
+    engine.rs          model-based tests vs BTreeMap, snapshots, concurrency, compaction
+    crash_recovery.rs  reopen, torn WAL, orphan SSTs, flush failure, dir lock
+    crash_kill.rs      SIGKILL a writer child process, verify every acked write
+  benches/          report.rs, throughput.rs, ycsb.rs
+  examples/         quickstart.rs
+  docs/             design spec, phase plans (phase-2 plan = module contracts)
 ```
 
 ## Roadmap

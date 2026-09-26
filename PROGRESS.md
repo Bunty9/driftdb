@@ -47,32 +47,32 @@
 
 ## Next
 
-- **Block cache**: LRU cache by (file, block_offset) to reduce decompression under
-  compaction/read storms. (ponytail: currently relies on OS page cache over mmap;
-  add when profiling shows decompression is a bottleneck — see `sstable.rs:34`.)
+- **Shared block cache**: today each SST keeps a tiny 8-block LRU for point reads.
+  A global, size-bounded cache would help large working sets.
+- **RocksDB comparison**: run the same YCSB mix against RocksDB on the same box.
 - **Per-level compaction round-robin cursor**: track the rightmost key in each level
-  to avoid starving rightmost files. (ponytail: comment at `compaction.rs:137`.)
+  to avoid starving rightmost files. (`ponytail:` note in `compaction.rs`.)
 - **Streaming memtable scan iterator**: avoid collecting all entries into a Vec for
   large `scan()` results. (ponytail: currently eager; upgrade once latency profiles
-  show large scans are a hot path — see `db.rs:361`.)
+  show large scans are a hot path; `ponytail:` note in `db.rs`.)
 - **Replication stretch (openraft)**: add multi-node consensus so driftdb can be
   embedded as a replicated state machine. (Out of scope for Phase 2.)
 - **Blog post**: "I built a tiny LSM and benchmarked it against RocksDB" — document
   design tradeoffs, crash semantics, and performance profiles. (Phase 2 stretch,
   per `projects-l3-l4.md` § P5.)
 
-## Bench numbers (targets per `projects-l3-l4.md` § P5; updated weekly)
+## Bench numbers (`cargo bench --bench report`, i5-9300H + NVMe, shared box)
 
-| metric                                              | target            | current | as-of      |
-|-----------------------------------------------------|-------------------|---------|------------|
-| Write amplification (leveled)                       | 5–10×             |         |            |
-| p99 read latency during compaction storm            | < 10 ms           |         |            |
-| Recovery on 10 GB WAL                               | < 5 s             |         |            |
-| Sustained write throughput (4 vCPU, group-commit)   | > 50,000 writes/s |         |            |
-| YCSB-C (100R) p99 vs RocksDB                        | within 2×         |         |            |
+| metric                                              | target            | current                          | as-of      |
+|-----------------------------------------------------|-------------------|----------------------------------|------------|
+| Write amplification (leveled)                       | 5–10×             | 5.2× (incl. WAL)                 | 2026-09-26 |
+| p99 read latency during compaction storm            | < 10 ms           | 14 µs                            | 2026-09-26 |
+| Recovery on 10 GB WAL                               | < 5 s             | n/a: WAL bounded to ~3× memtable; kill -9 recovery 9 ms | 2026-09-26 |
+| Sustained write throughput (4 vCPU, group-commit)   | > 50,000 writes/s | 93.8k/s @ 1024 writers           | 2026-09-26 |
+| YCSB-C (100R) p99 vs RocksDB                        | within 2×         | 169 µs p99; RocksDB run pending  | 2026-09-26 |
 
 ## Blog topics surfacing
 
 - **"I built a tiny LSM and benchmarked it against RocksDB"** — Phase 2 completed;
-  ready for write-up once bench numbers land. Cover design tradeoffs, fsync semantics,
+  bench numbers landed; RocksDB comparison still to run. Cover design tradeoffs, fsync semantics,
   group commit, leveled compaction, MVCC snapshot reads, crash recovery.
