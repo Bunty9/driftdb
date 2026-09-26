@@ -35,11 +35,14 @@ use std::time::Duration;
 pub struct Options {
     /// Freeze the active memtable and roll to a new WAL once its approximate size reaches this.
     ///
-    /// This also bounds recovery time: replay on reopen never reads more than
+    /// This also bounds recovery time: replay on reopen never reads more than roughly
     /// `memtable_size * (1 + MAX_IMMUTABLE_MEMTABLES)` bytes of WAL (the active memtable plus
     /// however many frozen-but-unflushed ones `rotate` allows to queue -- see
     /// `MAX_IMMUTABLE_MEMTABLES` in `db.rs`), since anything older has already been flushed to
-    /// an SST and its WAL deleted.
+    /// an SST and its WAL deleted. Each memtable can overshoot that budget by at most one
+    /// request's bytes (`write_batch`'s ops are never split across a group-commit boundary), since
+    /// the writer thread stops draining a group commit once it's already queued that many bytes
+    /// -- see `writer_thread`'s `budget` in `db.rs`.
     pub memtable_size: usize,
     /// Compact all of L0 (+ overlapping L1) once L0 holds at least this many files.
     pub l0_compaction_trigger: usize,
@@ -594,8 +597,9 @@ fn as_option(v: Value) -> Option<Vec<u8>> {
 /// How many frozen memtables `rotate` lets pile up (waiting on the background flush thread)
 /// before it stalls new writes. This is also the recovery-time bound: on crash, the WAL holds at
 /// most the active memtable plus this many frozen-but-unflushed ones, so replay on reopen never
-/// has more than `Options::memtable_size * (1 + MAX_IMMUTABLE_MEMTABLES)` bytes of WAL to read --
-/// see `Options::memtable_size`'s doc comment.
+/// has more than roughly `Options::memtable_size * (1 + MAX_IMMUTABLE_MEMTABLES)` bytes of WAL to
+/// read, plus at most one request's bytes per memtable -- see `Options::memtable_size`'s doc
+/// comment.
 const MAX_IMMUTABLE_MEMTABLES: usize = 2;
 
 /// Freeze the active memtable and open a fresh WAL, stalling (respecting shutdown/fatal) while
@@ -643,6 +647,24 @@ fn fail_rotate(ack: tokio::sync::oneshot::Sender<Result<Option<u64>>>, msg: &str
     let _ = ack.send(Err(Error::Io(std::io::Error::other(msg.to_string()))));
 }
 
+/// Total key+value bytes a request would add to the memtable (`0` for `Req::Rotate`, which adds
+/// nothing). Used by `writer_thread` to bound how many bytes one group commit drains.
+fn write_req_bytes(req: &Req) -> u64 {
+    match req {
+        Req::Write { batch, .. } => batch
+            .iter()
+            .map(|(k, v)| {
+                k.len() as u64
+                    + match v {
+                        Value::Put(v) => v.len() as u64,
+                        Value::Delete => 0,
+                    }
+            })
+            .sum(),
+        Req::Rotate { .. } => 0,
+    }
+}
+
 /// Cap on requests drained into one group-commit batch. Higher pays off under heavy concurrency
 /// (more puts amortized over one `fdatasync`); it costs nothing at low concurrency since
 /// `rx.try_recv()` simply returns empty once the queue is drained, so this is sized for the
@@ -658,22 +680,39 @@ fn writer_thread(inner: Arc<Inner>, rx: mpsc::Receiver<Req>, mut wal: WalFile) {
             Ok(r) => r,
             Err(_) => break, // every Sender dropped -- shut down.
         };
+        // Bound how many bytes this group commit can add to the active memtable: once the
+        // batch already holds at least `budget` bytes of ops, stop draining, even if
+        // `MAX_BATCH_REQUESTS` hasn't been reached yet. Without this, draining purely by request
+        // count let one group overshoot `memtable_size` by however much a burst of large
+        // requests added up to (up to `MAX_BATCH_REQUESTS` of them) before `rotate` ever got a
+        // chance to look at the size -- see `Options::memtable_size`'s doc comment. The first
+        // request is always taken regardless of `budget` so a single request larger than the
+        // whole budget still makes progress.
+        let budget = (inner.options.memtable_size as u64)
+            .saturating_sub(inner.mem.read().active.size() as u64);
+        let mut batch_bytes = write_req_bytes(&first);
         let mut batch = vec![first];
-        while batch.len() < MAX_BATCH_REQUESTS {
+        while batch.len() < MAX_BATCH_REQUESTS && batch_bytes < budget {
             match rx.try_recv() {
-                Ok(r) => batch.push(r),
+                Ok(r) => {
+                    batch_bytes += write_req_bytes(&r);
+                    batch.push(r);
+                }
                 Err(_) => break,
             }
         }
         if !inner.options.commit_window.is_zero() {
             let deadline = std::time::Instant::now() + inner.options.commit_window;
-            while batch.len() < MAX_BATCH_REQUESTS {
+            while batch.len() < MAX_BATCH_REQUESTS && batch_bytes < budget {
                 let now = std::time::Instant::now();
                 if now >= deadline {
                     break;
                 }
                 match rx.recv_timeout(deadline - now) {
-                    Ok(r) => batch.push(r),
+                    Ok(r) => {
+                        batch_bytes += write_req_bytes(&r);
+                        batch.push(r);
+                    }
                     Err(_) => break,
                 }
             }
