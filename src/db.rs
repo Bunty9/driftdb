@@ -24,6 +24,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::BTreeMap;
 use std::io::BufWriter;
 use std::ops::{Bound, RangeBounds};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
@@ -847,13 +848,48 @@ fn bg_thread(inner: Arc<Inner>) {
     }
 }
 
-/// Owns the writer-thread `Sender` and both thread `JoinHandle`s. Reachable only through
-/// `Db::guard` (an `Arc<Guard>`) -- never cloned into the threads themselves -- so when the last
-/// `Db` handle drops, this drops too, which is what actually tells the threads to stop.
+/// Take an exclusive, non-blocking `flock` on `dir/LOCK` (creating it if needed) so at most one
+/// `Db` -- in this process or another -- has `dir` open at a time. Two writers sharing a
+/// WAL/manifest would corrupt each other's state, and mmap-based WAL replay racing a live writer
+/// could SIGBUS, so this is checked before recovery touches anything else in `dir`.
+///
+/// The returned `File` must be kept open for as long as the lock should be held; the kernel
+/// releases the lock when the fd is closed (including on process exit, e.g. `kill -9`, which is
+/// exactly what lets `tests/crash_kill.rs`'s killed child not wedge the parent's reopen).
+fn acquire_dir_lock(dir: &Path) -> Result<std::fs::File> {
+    let path = dir.join("LOCK");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    // Safety: `flock` on an fd this call owns exclusively until it returns; LOCK_NB makes the
+    // call return immediately (EWOULDBLOCK) instead of blocking if another process holds it.
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Err(Error::Locked(dir.to_path_buf()));
+        }
+        return Err(err.into());
+    }
+    Ok(file)
+}
+
+/// Owns the writer-thread `Sender`, both thread `JoinHandle`s, and the directory lock. Reachable
+/// only through `Db::guard` (an `Arc<Guard>`) -- never cloned into the threads themselves -- so
+/// when the last `Db` handle drops, this drops too, which is what actually tells the threads to
+/// stop.
 struct Guard {
     inner: Arc<Inner>,
     sender: Mutex<Option<mpsc::Sender<Req>>>,
     handles: Mutex<Option<(std::thread::JoinHandle<()>, std::thread::JoinHandle<()>)>>,
+    /// The `dir/LOCK` file from [`acquire_dir_lock`]. Cleared (closing the fd, releasing the
+    /// flock) only *after* both threads have joined in `shutdown_and_join`, so a concurrent
+    /// `Db::open` on the same directory can never race the writer/background threads while they
+    /// still have the WAL or manifest open.
+    lock: Mutex<Option<std::fs::File>>,
 }
 
 impl Guard {
@@ -866,6 +902,7 @@ impl Guard {
             let _ = writer.join();
             let _ = bg.join();
         }
+        *self.lock.lock() = None;
     }
 }
 
@@ -1058,6 +1095,7 @@ impl Db {
 /// `docs/plans/2026-09-25-driftdb-phase-2.md`'s "Recovery" section for the sequence.
 fn open_sync(dir: &Path, options: Options) -> Result<Db> {
     std::fs::create_dir_all(dir)?;
+    let lock_file = acquire_dir_lock(dir)?;
     let (mut manifest, mstate) = Manifest::open(dir)?;
 
     let live_ssts: std::collections::HashSet<u64> =
@@ -1216,6 +1254,7 @@ fn open_sync(dir: &Path, options: Options) -> Result<Db> {
         inner,
         sender: Mutex::new(Some(tx)),
         handles: Mutex::new(Some((writer_handle, bg_handle))),
+        lock: Mutex::new(Some(lock_file)),
     });
     Ok(Db { guard })
 }

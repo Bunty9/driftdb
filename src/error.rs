@@ -40,6 +40,13 @@ pub enum Error {
     /// are unaffected.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    /// `Db::open`/`open_with` found `<dir>/LOCK` already held by another live `Db` (in this
+    /// process or another). Only one open `Db` per directory is supported: two writers sharing
+    /// a WAL/manifest would corrupt each other's state, and mmap-based WAL replay racing a live
+    /// writer could SIGBUS. Close/drop the other `Db` first.
+    #[error("driftdb: {0} is already open by another Db instance (directory lock held)")]
+    Locked(std::path::PathBuf),
 }
 
 /// Crate-wide `Result` alias.
