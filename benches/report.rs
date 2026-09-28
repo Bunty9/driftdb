@@ -410,11 +410,13 @@ fn bench_write_amplification(rt: &tokio::runtime::Runtime) -> String {
 
 /// Raw WAL replay throughput: write `DRIFTDB_BENCH_RECOVERY_MB` of incompressible records
 /// straight to one WAL file (bypassing `Db` entirely -- no manifest, no SST flush), then time
-/// `driftdb::wal::replay` decoding them back out. Isolates the replay decode path from the
+/// `driftdb::__bench::replay` decoding them back out. Isolates the replay decode path from the
 /// SST-flush-on-recovery cost `bench_recovery_time_default` also pays.
 fn bench_raw_replay_throughput(_rt: &tokio::runtime::Runtime) -> String {
-    use driftdb::memtable::Value;
-    use driftdb::wal::{wal_path, WalFile};
+    // `__bench` is `#[doc(hidden)]` and not part of the public API -- see its doc comment in
+    // `lib.rs`. It exists solely so this bench can drive `WalFile`/`replay` directly, bypassing
+    // `Db` entirely.
+    use driftdb::__bench::{wal_path, Value, WalFile};
 
     let recovery_mb = env_usize("DRIFTDB_BENCH_RECOVERY_MB", 20);
     let value_size = env_usize("DRIFTDB_BENCH_VALUE_SIZE", 100);
@@ -435,7 +437,7 @@ fn bench_raw_replay_throughput(_rt: &tokio::runtime::Runtime) -> String {
     eprintln!("[raw-replay] replaying {bytes_written} bytes ({records} records)...");
     let start = Instant::now();
     let mut count = 0u64;
-    driftdb::wal::replay(&path, |_seq, _key, _val| count += 1).expect("replay");
+    driftdb::__bench::replay(&path, |_seq, _key, _val| count += 1).expect("replay");
     let elapsed = start.elapsed();
     let mb_per_s = (bytes_written as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
     format!(

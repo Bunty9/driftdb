@@ -40,6 +40,7 @@
 
 #![deny(rust_2018_idioms)]
 #![warn(missing_debug_implementations)]
+#![warn(missing_docs)]
 
 // The WAL relies on `fdatasync(2)` and the directory lock on `flock(2)`. macOS has no
 // `fdatasync` (it would need `fcntl(F_FULLFSYNC)`) and Windows has neither, so fail with a
@@ -47,14 +48,36 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("driftdb currently supports Linux only (it needs fdatasync(2) and flock(2)).");
 
-pub mod compaction;
-pub mod db;
-pub mod error;
-pub mod iter;
-pub mod manifest;
-pub mod memtable;
-pub mod sstable;
-pub mod wal;
+// Internal modules. Not `pub`: the public surface is the re-exports below plus `__bench`. A
+// private `mod` declared at the crate root is still reachable from every other module in the
+// crate (privacy is scoped to the declaring module and its descendants, and every module is a
+// descendant of the root) -- it just isn't reachable from outside the crate, which is the point.
+mod compaction;
+mod db;
+mod error;
+mod iter;
+mod manifest;
+mod memtable;
+mod sstable;
+mod wal;
 
 pub use crate::db::{Db, Options, Snapshot, Stats, WriteBatch};
 pub use crate::error::{Error, Result};
+pub use crate::wal::{MAX_KEY_LEN, MAX_VALUE_LEN};
+
+/// On-disk format version shared by the manifest log and the SSTable footer. Bump this whenever
+/// the WAL, SST, or manifest byte layout changes in a way an older or newer build can't read;
+/// [`Db::open`] refuses a directory written by an unsupported version (see
+/// [`Error::UnsupportedFormat`]) instead of misreading it.
+pub(crate) const FORMAT_VERSION: u32 = 1;
+
+/// Not part of the public API; no semver guarantees; for benches only.
+///
+/// `benches/report.rs`'s raw WAL-replay bench needs to drive `WalFile`/`replay` directly
+/// (bypassing `Db` entirely) to isolate the replay decode path from the cost of flushing to an
+/// SST on recovery. Everything else should go through [`Db`].
+#[doc(hidden)]
+pub mod __bench {
+    pub use crate::memtable::Value;
+    pub use crate::wal::{replay, wal_path, WalFile};
+}

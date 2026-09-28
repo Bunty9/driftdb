@@ -41,7 +41,9 @@ impl Eq for InternalKey {}
 /// below the oldest live snapshot watermark.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
+    /// A live value.
     Put(Vec<u8>),
+    /// A tombstone: the key was deleted as of this version.
     Delete,
 }
 
@@ -123,11 +125,6 @@ impl Memtable {
         self.approx_bytes.load(Ordering::Relaxed)
     }
 
-    /// Number of versioned records held (not distinct keys).
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
     /// True if no records have been inserted.
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
@@ -206,14 +203,10 @@ mod tests {
     }
 
     #[test]
-    fn len_counts_versions_not_distinct_keys() {
+    fn is_empty_reflects_inserts() {
         let m = Memtable::new();
-        assert_eq!(m.len(), 0);
         assert!(m.is_empty());
         m.insert(b"a".to_vec(), 1, Value::Put(b"v1".to_vec()));
-        m.insert(b"a".to_vec(), 2, Value::Put(b"v2".to_vec()));
-        m.insert(b"b".to_vec(), 1, Value::Put(b"v1".to_vec()));
-        assert_eq!(m.len(), 3);
         assert!(!m.is_empty());
     }
 }

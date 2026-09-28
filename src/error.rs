@@ -13,7 +13,11 @@
 use thiserror::Error;
 
 /// Crate-wide error type. See module docs for the full taxonomy.
+///
+/// `#[non_exhaustive]`: new variants may be added in a minor (0.x) release; match with a
+/// wildcard arm (`_ => ...`) rather than exhaustively.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Underlying filesystem error from `std::io`.
     #[error("io: {0}")]

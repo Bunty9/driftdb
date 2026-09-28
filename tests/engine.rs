@@ -410,7 +410,7 @@ async fn oversized_key_and_value_are_rejected_and_db_stays_usable() {
         .await
         .expect("open");
 
-    let oversized_key = vec![b'k'; driftdb::wal::MAX_KEY_LEN + 1];
+    let oversized_key = vec![b'k'; driftdb::MAX_KEY_LEN + 1];
     let err = db
         .put(&oversized_key, b"v")
         .await
@@ -419,7 +419,7 @@ async fn oversized_key_and_value_are_rejected_and_db_stays_usable() {
 
     // A value this large would take a while to allocate/hash for no test value; a few bytes
     // over the limit is enough to exercise the check.
-    let oversized_value = vec![b'v'; driftdb::wal::MAX_VALUE_LEN + 1];
+    let oversized_value = vec![b'v'; driftdb::MAX_VALUE_LEN + 1];
     let err = db
         .put(b"k", &oversized_value)
         .await
