@@ -1,10 +1,7 @@
 # driftdb
 
 > Embeddable LSM-tree key-value engine in Rust. WAL group-commit, MVCC
-> snapshot reads, leveled compaction, mmap-backed SSTable reads. Built
-> as the storage-engineering portfolio project for the Rust Level-4
-> roadmap — the canonical interview pitch: _"I wanted to understand
-> fsync semantics, so I wrote my own LSM."_
+> snapshot reads, leveled compaction, mmap-backed SSTable reads.
 
 [![ci](https://github.com/Bunty9/driftdb/actions/workflows/ci.yml/badge.svg)](https://github.com/Bunty9/driftdb/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/driftdb-lsm.svg)](https://crates.io/crates/driftdb-lsm)
@@ -13,13 +10,11 @@
 
 ## The problem
 
-Most app-tier code reaches for Postgres + JSON files for state. Adding
-a real embedded engine — WAL durability, MVCC snapshot reads, leveled
-compaction — is the canonical storage-engineering interview project.
-**driftdb** is that engine, sized to embed into the other roadmap
-projects (rustyq job-queue metadata, agent state, edge-runtime
-checkpoints) and to ship as a public crate with reproducible
-YCSB-style benchmarks.
+Most app-tier code reaches for Postgres + JSON files for state. **driftdb**
+is a real embedded engine instead — WAL durability, MVCC snapshot reads,
+leveled compaction — sized to embed into job-queue metadata, agent state,
+or edge-runtime checkpoints, and shipped as a public crate with
+reproducible YCSB-style benchmarks.
 
 ## Architecture
 
@@ -138,8 +133,7 @@ version 1.
 
 ## Design tradeoffs
 
-The defenses behind every load-bearing engine choice. These are the
-answers you give in the storage-engineering interview.
+The reasoning behind each load-bearing engine choice.
 
 ### Leveled vs tiered compaction
 
@@ -197,11 +191,14 @@ bincode-encoded.
   index uses.
 - The cost is that bincode lacks forward/backward compatibility — a
   field reorder in `ManifestRecord` is a breaking change for on-disk
-  files. driftdb owns its formats and ships major-version bumps on
-  format changes, so this is acceptable.
-- The stretch goal in `projects-l3-l4.md` is to replace the index
-  with a hand-rolled binary format once profiling shows the bincode
-  decode is on the read-path hot path.
+  files. driftdb owns its formats; while the crate is pre-1.0, a minor
+  version bump (`0.1` to `0.2`) may change the on-disk format instead
+  of waiting for a major bump — see the Changelog. The format-version
+  marker on the manifest and SST footer means an old build refuses a
+  newer on-disk format (and vice versa) rather than misreading it.
+- A future direction is to replace the index with a hand-rolled binary
+  format once profiling shows the bincode decode is on the read-path
+  hot path.
 
 ## Benchmarks
 
