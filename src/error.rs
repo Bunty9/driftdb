@@ -50,6 +50,18 @@ pub enum Error {
     /// writer could SIGBUS. Close/drop the other `Db` first.
     #[error("driftdb: {0} is already open by another Db instance (directory lock held)")]
     Locked(std::path::PathBuf),
+
+    /// `Db::open`/`open_with` found a manifest (or SST) written by an on-disk format version
+    /// this build doesn't support. Checked before recovery touches any WAL or SST file, so the
+    /// directory is left exactly as found — nothing is deleted or rewritten. Open it with a
+    /// driftdb version that supports `found` instead.
+    #[error("driftdb: on-disk format version {found} is not supported (this build supports {supported})")]
+    UnsupportedFormat {
+        /// The format version recorded on disk.
+        found: u32,
+        /// The format version this build supports.
+        supported: u32,
+    },
 }
 
 /// Crate-wide `Result` alias.

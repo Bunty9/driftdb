@@ -34,6 +34,12 @@ the crate. `wal.rs` and `sstable.rs` both build on `memtable`'s record shape.
 `db.rs` (`Inner::scan_at`) and `compaction.rs` (`compaction::run`).
 `manifest.rs` depends only on `error.rs`.
 
+Every module above is private (`mod`, not `pub mod`) — the public surface `lib.rs`
+re-exports is just `Db`, `Options`, `Snapshot`, `Stats`, `WriteBatch`, `Error`, `Result`,
+and the root constants `MAX_KEY_LEN`/`MAX_VALUE_LEN`. `#[doc(hidden)] pub mod __bench`
+also re-exports a few `wal`/`memtable` items for `benches/report.rs`'s raw-replay bench;
+it carries no semver guarantee.
+
 There is exactly one two-way edge: `db.rs` and `compaction.rs` depend on each
 other's types. `compaction::pick`/`pick_inner`/`run` take `crate::db::Options`
 as a parameter, and `db.rs` imports `compaction::{CompactionPlan, Table,
@@ -288,10 +294,16 @@ Briefly — the README and each module's header own the exact layouts:
   record `[crc32][seq][kind][klen][vlen][key][val]`.
 - **SSTable** (`sstable.rs`): zstd-compressed 4 KiB data blocks, a bincode
   index (`Vec<(last_key, block_offset)>`), a bincode `GrowableBloom`, a
-  32-byte footer with offsets, a region CRC, and a magic number.
+  32-byte footer with offsets, a region CRC, a format version, and a magic
+  number.
 - **Manifest** (`manifest.rs`): append-only log of framed edits
   (`[len][crc32][bincode(Vec<ManifestRecord>)]`), compacted to one snapshot
   frame on every `Manifest::open`.
+- **Format version**: `FORMAT_VERSION` (`lib.rs`) is shared by the manifest's
+  `ManifestRecord::FormatVersion` and the SST footer's `format_version` field.
+  `Manifest::open` checks it before doing anything else — no rewrite, no WAL
+  replay, no deletions — and refuses with `Error::UnsupportedFormat` on a
+  mismatch; `SstReader::open` does the same per-file with `Error::SstCorrupt`.
 
 See the README's "On-disk formats" section for full field layouts, and its
 "Design tradeoffs" for `fdatasync` vs `fsync`, the MVCC GC watermark, and

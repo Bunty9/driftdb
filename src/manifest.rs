@@ -33,6 +33,14 @@
 //! Atomic update: `append` writes one frame then `sync_data`s. A successful append is what
 //! makes a flush/compaction visible; a crash before the append leaves the new SST(s) orphaned,
 //! to be GC'd at next open.
+//!
+//! ## Format version
+//!
+//! Every snapshot rewrite appends a [`ManifestRecord::FormatVersion`] record carrying
+//! [`crate::FORMAT_VERSION`]. `Manifest::open` checks the replayed version *before* doing that
+//! rewrite (or anything else) and refuses with [`Error::UnsupportedFormat`] on a mismatch,
+//! leaving the directory untouched. A manifest with no `FormatVersion` record at all (written
+//! before this field existed) is treated as format version 1.
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -69,6 +77,12 @@ pub enum ManifestRecord {
     /// appearing in a live `SstAdded`, so `next_file_number` can't always be recovered from the
     /// live SST set alone — the snapshot rewrite emits one of these to carry it forward.
     NextFileNumber(u64),
+    /// The on-disk format version this manifest (and the SSTs/WALs it describes) was written
+    /// under. Appended by every snapshot rewrite (see [`ManifestState::snapshot_edit`]). Added
+    /// after `NextFileNumber` — new variants must always go at the end (see the enum's docs) —
+    /// so a manifest predating this variant simply never applies one, which `Manifest::open`
+    /// treats as format version 1 (see its docs).
+    FormatVersion(u32),
 }
 
 /// In-memory replay of the manifest log: the live SST set per level plus the durability/
@@ -82,6 +96,10 @@ pub struct ManifestState {
     pub last_seq: u64,
     /// Strictly greater than every SST number seen so far; always >= 1.
     pub next_file_number: u64,
+    /// The format version recorded by the last `FormatVersion` record replayed, or `0` if none
+    /// was ever seen (a manifest written before this field existed). `Manifest::open` treats `0`
+    /// here as format version 1 — see its docs.
+    pub format_version: u32,
 }
 
 impl ManifestState {
@@ -115,6 +133,9 @@ impl ManifestState {
             ManifestRecord::NextFileNumber(n) => {
                 self.next_file_number = self.next_file_number.max(*n).max(1);
             }
+            ManifestRecord::FormatVersion(v) => {
+                self.format_version = self.format_version.max(*v);
+            }
         }
     }
 
@@ -136,6 +157,7 @@ impl ManifestState {
             last_seq: self.last_seq,
         });
         edit.push(ManifestRecord::NextFileNumber(self.next_file_number));
+        edit.push(ManifestRecord::FormatVersion(self.format_version));
         edit
     }
 }
@@ -197,6 +219,23 @@ impl Manifest {
             Err(e) => return Err(e.into()),
         }
         state.next_file_number = state.next_file_number.max(1);
+
+        // A manifest that never recorded a `FormatVersion` (0) predates this field and is
+        // implicitly version 1 -- see `ManifestState::format_version`'s docs. Checked *before*
+        // the snapshot rewrite below so an unsupported version is refused without touching the
+        // directory at all: no rewrite, no WAL replay, no deletions.
+        let found_version = if state.format_version == 0 {
+            1
+        } else {
+            state.format_version
+        };
+        if found_version != crate::FORMAT_VERSION {
+            return Err(Error::UnsupportedFormat {
+                found: found_version,
+                supported: crate::FORMAT_VERSION,
+            });
+        }
+        state.format_version = crate::FORMAT_VERSION;
 
         let frame = encode_edit(&state.snapshot_edit())?;
         {
@@ -554,6 +593,45 @@ mod tests {
         let after = fs::read(&manifest_path).unwrap();
         assert_eq!(before, after, "a failed open must not rewrite MANIFEST");
         assert!(!dir.path().join("MANIFEST.tmp").exists());
+    }
+
+    #[test]
+    fn unsupported_format_version_is_rejected_and_manifest_untouched() {
+        let dir = tempdir().unwrap();
+        let manifest_path = dir.path().join("MANIFEST");
+        let (mut m, _s) = Manifest::open(dir.path()).unwrap();
+        m.append(&[ManifestRecord::FormatVersion(2)]).unwrap();
+        drop(m);
+
+        let before = fs::read(&manifest_path).unwrap();
+        let err = Manifest::open(dir.path()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::UnsupportedFormat {
+                    found: 2,
+                    supported: 1,
+                }
+            ),
+            "got {err:?}"
+        );
+        let after = fs::read(&manifest_path).unwrap();
+        assert_eq!(
+            before, after,
+            "a manifest with an unsupported format version must not be rewritten"
+        );
+        assert!(!dir.path().join("MANIFEST.tmp").exists());
+    }
+
+    #[test]
+    fn absent_format_version_is_treated_as_version_one() {
+        let dir = tempdir().unwrap();
+        let (m, s) = Manifest::open(dir.path()).unwrap();
+        // A fresh open already rewrites the snapshot with the current version stamped in.
+        assert_eq!(s.format_version, crate::FORMAT_VERSION);
+        drop(m);
+        let (_m2, s2) = Manifest::open(dir.path()).unwrap();
+        assert_eq!(s2.format_version, crate::FORMAT_VERSION);
     }
 
     #[test]

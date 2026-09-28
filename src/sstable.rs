@@ -14,9 +14,13 @@
 //!   | bloom block     |   bincode: GrowableBloom
 //!   +-----------------+
 //!   | footer (32B)    |   [u64 BE index_off][u64 BE bloom_off][u32 BE crc32(index..bloom)]
-//!   |                 |   [u32 BE reserved=0][u64 BE magic=0xDEADBEEF]
+//!   |                 |   [u32 BE format_version][u64 BE magic=0xDEADBEEF]
 //!   +-----------------+
 //! ```
+//!
+//! `format_version` is [`crate::FORMAT_VERSION`], written by every [`SstWriter::finish`].
+//! [`SstReader::open`] rejects any other value with [`Error::SstCorrupt`] rather than trying to
+//! read a layout it doesn't understand.
 //!
 //! Each data block entry: `[u32 BE klen][u32 BE vlen][u64 BE seq][u8 kind][key][val]`
 //! where `kind` is 1 for Put and 0 for Delete (the val bytes are absent for Delete).
@@ -233,7 +237,7 @@ impl<W: Write> SstWriter<W> {
         self.w.write_all(&index_off.to_be_bytes())?;
         self.w.write_all(&bloom_off.to_be_bytes())?;
         self.w.write_all(&region_crc.to_be_bytes())?;
-        self.w.write_all(&0u32.to_be_bytes())?; // reserved
+        self.w.write_all(&crate::FORMAT_VERSION.to_be_bytes())?;
         self.w.write_all(&SSTABLE_MAGIC.to_be_bytes())?;
         self.w.flush()?;
 
@@ -343,13 +347,20 @@ impl SstReader {
         let index_off = u64::from_be_bytes(footer[0..8].try_into().unwrap());
         let bloom_off = u64::from_be_bytes(footer[8..16].try_into().unwrap());
         let region_crc_expected = u32::from_be_bytes(footer[16..20].try_into().unwrap());
-        // footer[20..24] is reserved.
+        let format_version = u32::from_be_bytes(footer[20..24].try_into().unwrap());
         let magic = u64::from_be_bytes(footer[24..32].try_into().unwrap());
         if magic != SSTABLE_MAGIC {
             return Err(Error::SstCorrupt(format!(
                 "{}: bad magic {:#x}",
                 path.display(),
                 magic
+            )));
+        }
+        if format_version != crate::FORMAT_VERSION {
+            return Err(Error::SstCorrupt(format!(
+                "{}: unsupported SST format version {format_version} (supported: {})",
+                path.display(),
+                crate::FORMAT_VERSION
             )));
         }
         if !(index_off <= bloom_off && bloom_off <= footer_start) {
@@ -796,6 +807,29 @@ mod tests {
         // bloom filter.
         let err = SstReader::open(&path).unwrap_err();
         assert!(matches!(err, Error::SstCorrupt(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn unsupported_format_version_errors_without_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sst");
+        write_sst(&path, &[(b"a".to_vec(), 1, Value::Put(b"v".to_vec()))]);
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let footer_start = bytes.len() - FOOTER_LEN as usize;
+        // format_version is footer bytes [20..24).
+        bytes[footer_start + 20..footer_start + 24]
+            .copy_from_slice(&(crate::FORMAT_VERSION + 1).to_be_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = SstReader::open(&path).unwrap_err();
+        match &err {
+            Error::SstCorrupt(msg) => assert!(
+                msg.contains("unsupported") && msg.contains("version"),
+                "got {msg:?}"
+            ),
+            other => panic!("got {other:?}"),
+        }
     }
 
     #[test]

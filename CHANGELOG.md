@@ -32,6 +32,15 @@ First public release, published as `driftdb-lsm` and imported as `driftdb`.
 - Tests: model-based engine tests, crash-recovery tests, and a `kill -9`
   child-process crash test. Benches: criterion throughput and YCSB A/B/C/F,
   plus a one-shot `report` bench.
+- On-disk format version markers: a `FormatVersion` manifest record and an
+  SST footer `format_version` field, both checked on open. `Db::open`
+  refuses a directory written by an unsupported version instead of
+  misreading it.
+- Narrowed public API: only `Db`, `Options`, `Snapshot`, `Stats`,
+  `WriteBatch`, `Error`, `Result`, and the root constants `MAX_KEY_LEN` /
+  `MAX_VALUE_LEN` are public; the `wal`/`sstable`/`manifest`/`memtable`/
+  `iter`/`compaction`/`db`/`error` modules are internal. `Error` and
+  `Stats` are `#[non_exhaustive]`.
 
 ### Platform
 

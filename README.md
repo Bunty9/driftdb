@@ -86,9 +86,12 @@ torn-tail garbage and truncated on replay.
   | bloom block     |   bincode: GrowableBloom
   +-----------------+
   | footer (32 B)   |   [u64 BE index_off][u64 BE bloom_off][u32 BE crc32(index..bloom)]
-  |                 |   [u32 BE reserved=0][u64 BE magic=0xDEADBEEF]
+  |                 |   [u32 BE format_version][u64 BE magic=0xDEADBEEF]
   +-----------------+
 ```
+
+`format_version` is the SST format version (currently `1`). `SstReader::open` rejects any
+other value with `Error::SstCorrupt` rather than guessing at a layout it doesn't know.
 
 Each data-block entry (inside the decompressed block):
 
@@ -117,14 +120,20 @@ that must apply atomically (e.g., a compaction's adds and deletes):
 ```
 
 Each `ManifestRecord` is either `SstAdded { level, meta }`, `SstDeleted { level, number }`,
-`WalFlushed { number, last_seq }`, or `NextFileNumber(u64)`. Records within a frame are
-applied atomically to the in-memory `ManifestState`.
+`WalFlushed { number, last_seq }`, `NextFileNumber(u64)`, or `FormatVersion(u32)`. Records
+within a frame are applied atomically to the in-memory `ManifestState`.
 
 A torn or CRC-mismatched frame at the tail of the file is silently dropped on replay
 (not an error). The same goes for an all-zero `[len=0][crc=0]` frame. On open, the
 manifest is immediately rewritten as a single snapshot edit (atomically via tmp+rename)
-to prevent unbounded growth — only the live SST set plus the file-number allocator are
-carried forward.
+to prevent unbounded growth — only the live SST set plus the file-number allocator and
+`FormatVersion` are carried forward.
+
+`FormatVersion(u32)` records the on-disk format version (currently `1`, shared with the
+SST footer's `format_version`). `Manifest::open` checks it — before doing the snapshot
+rewrite or touching any WAL/SST — and refuses with `Error::UnsupportedFormat` on a
+mismatch, leaving the directory untouched. A manifest with no `FormatVersion` record at
+all (written before this field existed) is treated as version 1.
 
 ## Design tradeoffs
 
