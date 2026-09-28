@@ -622,3 +622,83 @@ async fn concurrent_compacts_both_finish_with_writes_between() {
     .await
     .expect("both concurrent compact() calls must finish, not livelock");
 }
+
+#[tokio::test]
+async fn default_options_are_valid() {
+    let dir = TempDir::new().unwrap();
+    Db::open(dir.path()).await.expect("defaults must open fine");
+}
+
+#[tokio::test]
+async fn out_of_range_options_are_rejected_without_touching_the_directory() {
+    use driftdb::Error;
+
+    // Each case starts from a valid baseline and breaks exactly one field, so any failure is
+    // attributable to that field's check.
+    let cases: Vec<(&str, Options)> = vec![
+        (
+            "memtable_size",
+            Options {
+                memtable_size: 0,
+                ..small_options()
+            },
+        ),
+        (
+            "l0_compaction_trigger",
+            Options {
+                l0_compaction_trigger: 0,
+                ..small_options()
+            },
+        ),
+        (
+            "l1_max_bytes",
+            Options {
+                l1_max_bytes: 0,
+                ..small_options()
+            },
+        ),
+        (
+            "level_multiplier",
+            Options {
+                level_multiplier: 0,
+                ..small_options()
+            },
+        ),
+        (
+            "target_file_size",
+            Options {
+                target_file_size: 0,
+                ..small_options()
+            },
+        ),
+        (
+            "max_levels too small",
+            Options {
+                max_levels: 1,
+                ..small_options()
+            },
+        ),
+        (
+            "max_levels too large",
+            Options {
+                max_levels: 256,
+                ..small_options()
+            },
+        ),
+    ];
+
+    for (label, opts) in cases {
+        let dir = TempDir::new().unwrap();
+        let err = Db::open_with(dir.path(), opts)
+            .await
+            .expect_err(&format!("{label}: must be rejected"));
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "{label}: got {err:?}"
+        );
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+            "{label}: rejected Options must not touch the directory"
+        );
+    }
+}

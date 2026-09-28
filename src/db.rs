@@ -48,22 +48,41 @@ pub struct Options {
     /// request's bytes (`write_batch`'s ops are never split across a group-commit boundary), since
     /// the writer thread stops draining a group commit once it's already queued that many bytes
     /// -- see `writer_thread`'s `budget` in `db.rs`.
+    ///
+    /// Range: `>= MIN_MEMTABLE_SIZE` (1 KiB). `Db::open`/`open_with` rejects anything smaller
+    /// with `Error::InvalidArgument`.
     pub memtable_size: usize,
     /// Compact all of L0 (+ overlapping L1) once L0 holds at least this many files.
+    ///
+    /// Range: `>= 1`.
     pub l0_compaction_trigger: usize,
     /// L1's byte budget; `L_n`'s budget is `l1_max_bytes * level_multiplier^(n-1)`.
+    ///
+    /// Range: `>= 1`.
     pub l1_max_bytes: u64,
     /// Per-level growth factor for the byte budget above.
+    ///
+    /// Range: `>= 1` (`1` disables growth: every level above L1 shares L1's budget).
     pub level_multiplier: u32,
     /// Roll to a new output SST once a compaction/flush output reaches this size (only at a
     /// user-key boundary).
+    ///
+    /// Range: `>= 1`.
     pub target_file_size: u64,
     /// Number of levels, L0..L(max_levels-1). The bottom level is never a compaction source.
+    ///
+    /// Range: `2..=255` (at least L0 + one bottom level; compaction encodes a level number as
+    /// `u8`, so `max_levels - 1` must fit in a `u8`).
     pub max_levels: usize,
     /// How long the writer thread waits for more writes to batch after draining what's already
     /// queued, once at least one request has arrived. `Duration::ZERO` disables the wait.
     pub commit_window: Duration,
 }
+
+/// Floor for [`Options::memtable_size`]. Small enough not to break tests that deliberately use
+/// a tiny memtable to force frequent rotation, large enough that a `Db` isn't rotating memtables
+/// (and WAL files) on every single write.
+const MIN_MEMTABLE_SIZE: usize = 1024;
 
 impl Default for Options {
     fn default() -> Self {
@@ -76,6 +95,44 @@ impl Default for Options {
             max_levels: 7,
             commit_window: Duration::ZERO,
         }
+    }
+}
+
+impl Options {
+    /// Reject out-of-range fields with [`Error::InvalidArgument`]. Called by
+    /// `Db::open`/`open_with` before the target directory is touched.
+    fn validate(&self) -> Result<()> {
+        if self.memtable_size < MIN_MEMTABLE_SIZE {
+            return Err(Error::InvalidArgument(format!(
+                "memtable_size {} is below the minimum of {MIN_MEMTABLE_SIZE}",
+                self.memtable_size
+            )));
+        }
+        if self.l0_compaction_trigger < 1 {
+            return Err(Error::InvalidArgument(
+                "l0_compaction_trigger must be >= 1".into(),
+            ));
+        }
+        if self.l1_max_bytes < 1 {
+            return Err(Error::InvalidArgument("l1_max_bytes must be >= 1".into()));
+        }
+        if self.level_multiplier < 1 {
+            return Err(Error::InvalidArgument(
+                "level_multiplier must be >= 1".into(),
+            ));
+        }
+        if self.target_file_size < 1 {
+            return Err(Error::InvalidArgument(
+                "target_file_size must be >= 1".into(),
+            ));
+        }
+        if !(2..=255).contains(&self.max_levels) {
+            return Err(Error::InvalidArgument(format!(
+                "max_levels {} must be in 2..=255",
+                self.max_levels
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1120,7 +1177,11 @@ impl Db {
     /// Open (or create) a driftdb instance rooted at `path` with custom [`Options`]. Runs
     /// recovery (manifest replay, orphan cleanup, WAL replay) synchronously on a blocking
     /// thread before returning.
+    ///
+    /// Validates `options` first (see each [`Options`] field's documented range) and fails with
+    /// [`Error::InvalidArgument`] without touching `path` at all if any field is out of range.
     pub async fn open_with(path: impl AsRef<Path>, options: Options) -> Result<Self> {
+        options.validate()?;
         let dir = path.as_ref().to_path_buf();
         tokio::task::spawn_blocking(move || open_sync(&dir, options))
             .await
