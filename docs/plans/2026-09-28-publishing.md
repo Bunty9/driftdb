@@ -1,6 +1,6 @@
 # Publishing plan: `driftdb-lsm` 0.1.0 on crates.io
 
-Status: metadata configured, release not started. Nothing has been published.
+Status: **done**. `driftdb-lsm` 0.1.0 was published to crates.io on 2026-09-28, tagged `v0.1.0`, with a GitHub release. The blockers below were all fixed before publishing.
 Publishing is irreversible: a version can be yanked but never deleted or
 re-uploaded. So every step marked **(owner)** needs the crate owner to act or
 approve.
