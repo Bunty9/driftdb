@@ -42,11 +42,13 @@ const HEADER_LEN: usize = 4 + 8 + 1 + 4 + 4;
 const KIND_DELETE: u8 = 0;
 const KIND_PUT: u8 = 1;
 
-/// Largest key `WalFile::append` (and the rest of the on-disk formats) will encode. `Db`
-/// rejects larger inputs before they ever reach here — this module only `debug_assert`s it.
+/// Maximum key length accepted by [`crate::Db::put`]/[`crate::Db::delete`]/
+/// [`crate::Db::write_batch`]; longer keys fail with [`crate::Error::InvalidArgument`]. `Db`
+/// rejects oversized inputs before they ever reach here — this module only `debug_assert`s it.
 pub const MAX_KEY_LEN: usize = 65_535;
-/// Largest value `WalFile::append` (and the rest of the on-disk formats) will encode. `Db`
-/// rejects larger inputs before they ever reach here — this module only `debug_assert`s it.
+/// Maximum value length accepted by [`crate::Db::put`]/[`crate::Db::write_batch`] (256 MiB);
+/// longer values fail with [`crate::Error::InvalidArgument`]. `Db` rejects oversized inputs
+/// before they ever reach here — this module only `debug_assert`s it.
 pub const MAX_VALUE_LEN: usize = 256 * 1024 * 1024;
 
 /// Path for WAL generation `number` inside `dir` — `dir/wal-NNNNNN.log`.
