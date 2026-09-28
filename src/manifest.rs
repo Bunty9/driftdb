@@ -37,10 +37,19 @@
 //! ## Format version
 //!
 //! Every snapshot rewrite appends a [`ManifestRecord::FormatVersion`] record carrying
-//! [`crate::FORMAT_VERSION`]. `Manifest::open` checks the replayed version *before* doing that
-//! rewrite (or anything else) and refuses with [`Error::UnsupportedFormat`] on a mismatch,
-//! leaving the directory untouched. A manifest with no `FormatVersion` record at all (written
-//! before this field existed) is treated as format version 1.
+//! [`crate::FORMAT_VERSION`]. `Manifest::open` checks the version *as it replays each frame* —
+//! not only after the whole log has been read — and refuses with [`Error::UnsupportedFormat`]
+//! the instant a too-new version is seen, before decoding any later frame or touching the
+//! directory in any way (no rewrite, no WAL replay, no deletions). A manifest with no
+//! `FormatVersion` record at all (written before this field existed) is treated as format
+//! version 1.
+//!
+//! **Forward-compatibility contract:** a future, incompatible format change must write a
+//! standalone `[FormatVersion(n)]` frame *first* — before any frame containing a record this
+//! build might not understand. That ordering is what lets an old build recognize the format is
+//! too new and stop immediately, rather than pressing on into a later frame that doesn't even
+//! bincode-decode as a valid `ManifestRecord` and getting the misleading `ManifestCorrupt`
+//! instead of `UnsupportedFormat`.
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -195,6 +204,19 @@ impl Manifest {
                                 state.apply(rec);
                             }
                             offset += consumed;
+                            // Bail out the instant an unsupported (too new) format version is
+                            // seen, before decoding any later frame -- see the module docs'
+                            // forward-compat contract. A future, incompatible format's frames
+                            // after the `FormatVersion` marker aren't guaranteed to even
+                            // bincode-decode as `ManifestRecord` under this build, so waiting
+                            // until the whole log is replayed could surface the wrong error
+                            // (`ManifestCorrupt`) instead of `UnsupportedFormat`.
+                            if state.format_version > crate::FORMAT_VERSION {
+                                return Err(Error::UnsupportedFormat {
+                                    found: state.format_version,
+                                    supported: crate::FORMAT_VERSION,
+                                });
+                            }
                         }
                         Frame::Torn => break,
                         Frame::Suspect { frame_len } => {
@@ -621,6 +643,46 @@ mod tests {
             before, after,
             "a manifest with an unsupported format version must not be rewritten"
         );
+        assert!(!dir.path().join("MANIFEST.tmp").exists());
+    }
+
+    #[test]
+    fn unsupported_format_version_short_circuits_before_a_later_undecodable_frame() {
+        // Simulates a future, incompatible manifest: a standalone `[FormatVersion(2)]` frame
+        // first, per the forward-compat contract in the module docs, followed by a frame this
+        // build has no hope of bincode-decoding as `ManifestRecord` (a stand-in for a record
+        // kind that doesn't exist yet). The version check must fire on the first frame and
+        // return `UnsupportedFormat` without ever attempting to decode the second — if it did,
+        // it would surface the wrong error (`ManifestCorrupt`) instead.
+        let dir = tempdir().unwrap();
+        let manifest_path = dir.path().join("MANIFEST");
+
+        let frame0 = encode_edit(&[ManifestRecord::FormatVersion(2)]).unwrap();
+        let garbage_payload = b"not a valid bincode Vec<ManifestRecord> at all, just junk";
+        let mut frame1 = Vec::new();
+        frame1.extend_from_slice(&(garbage_payload.len() as u32).to_be_bytes());
+        frame1.extend_from_slice(&crc32fast::hash(garbage_payload).to_be_bytes());
+        frame1.extend_from_slice(garbage_payload);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&frame0);
+        bytes.extend_from_slice(&frame1);
+        fs::write(&manifest_path, &bytes).unwrap();
+
+        let before = fs::read(&manifest_path).unwrap();
+        let err = Manifest::open(dir.path()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::UnsupportedFormat {
+                    found: 2,
+                    supported: 1,
+                }
+            ),
+            "got {err:?}"
+        );
+        let after = fs::read(&manifest_path).unwrap();
+        assert_eq!(before, after, "a failed open must not rewrite MANIFEST");
         assert!(!dir.path().join("MANIFEST.tmp").exists());
     }
 
