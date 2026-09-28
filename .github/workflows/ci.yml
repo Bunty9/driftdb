@@ -37,6 +37,34 @@ jobs:
       - name: cargo test
         run: cargo test
 
+  msrv:
+    name: msrv (1.85)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.85"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check (lib) on rust-version
+        run: cargo check --lib
+
+  docs:
+    name: rustdoc + package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo doc (deny warnings, as docs.rs would render)
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest

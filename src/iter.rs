@@ -1,4 +1,4 @@
-//! Merging and MVCC/GC filtering over sorted streams of [`Entry`](crate::memtable::Entry).
+//! Merging and MVCC/GC filtering over sorted streams of [`Entry`].
 //!
 //! ## Ordering
 //!

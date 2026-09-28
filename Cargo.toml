@@ -1,13 +1,37 @@
 [package]
-name = "driftdb"
+# `driftdb` is taken on crates.io (an unrelated real-time backend), so the package is
+# published as `driftdb-lsm`; the library keeps the `driftdb` import path (see [lib]).
+name = "driftdb-lsm"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
+authors = ["Bunty9 <Bunty9@users.noreply.github.com>"]
 license = "MIT OR Apache-2.0"
 description = "Embeddable LSM-tree key-value engine with WAL group-commit, MVCC snapshot reads, and leveled compaction."
 repository = "https://github.com/Bunty9/driftdb"
-keywords = ["lsm", "storage", "kv", "wal", "mvcc"]
-categories = ["database-implementations"]
+homepage = "https://github.com/Bunty9/driftdb"
+documentation = "https://docs.rs/driftdb-lsm"
 readme = "README.md"
+keywords = ["lsm", "storage-engine", "key-value", "wal", "mvcc"]
+categories = ["database-implementations", "data-structures"]
+# Ship only what builds and documents the crate; design notes and CI config stay in the repo.
+include = [
+    "/src",
+    "/tests",
+    "/benches",
+    "/examples",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+]
+
+[lib]
+name = "driftdb"
+
+[package.metadata.docs.rs]
+# Linux-only for now (fdatasync + flock); see the compile_error! in lib.rs.
+targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
 # Not the execution model here — the WAL writer and background flush/compaction threads are

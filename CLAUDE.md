@@ -10,6 +10,12 @@ The public API is async (`Db::open`, `put`, `get`, `delete`, `write_batch`,
 runs on two std threads per `Db`. Tokio is only used for `oneshot` acks and
 `spawn_blocking`, and the library enables just its `sync` and `rt` features.
 
+Packaging facts:
+- **Name:** published as `driftdb-lsm`, because `driftdb` on crates.io is an unrelated crate. `[lib] name = "driftdb"` keeps the import path `use driftdb::…`.
+- **MSRV:** 1.85 (`rust-version`, checked by CI's msrv job).
+- **Platform:** Linux only; `lib.rs` has a `compile_error!` for other targets.
+- **Release status:** not yet published. `docs/plans/2026-09-28-publishing.md` lists the pre-release blockers and the release steps. Never run `cargo publish` without the owner's explicit go-ahead.
+
 Docs to read before non-trivial changes:
 - `docs/ARCHITECTURE.md`: internals guide covering threads, locks, invariants and recovery.
 - `docs/plans/2026-09-25-driftdb-phase-2.md`: module interface contracts.
@@ -34,8 +40,9 @@ cargo bench --no-run                           # benches build slowly: fat LTO, 
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy and `cargo test` on stable and on
-beta. The beta leg overrides `rust-toolchain.toml` via `RUSTUP_TOOLCHAIN`. CI also
-runs `cargo deny check` and `cargo bench --no-run`.
+beta. The beta leg overrides `rust-toolchain.toml` via `RUSTUP_TOOLCHAIN`. CI also runs
+`cargo deny check`, `cargo bench --no-run`, an MSRV `cargo check`, and
+`cargo doc` (with `-D warnings`) plus `cargo publish --dry-run`.
 
 ## Architecture (big picture)
 

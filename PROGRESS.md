@@ -47,6 +47,9 @@
 
 ## Next
 
+- **Publish 0.1.0 as `driftdb-lsm`**. Metadata is done; the blockers are listed in
+  `docs/plans/2026-09-28-publishing.md` (shrink the public API, missing docs, on-disk
+  format version).
 - **Shared block cache**: today each SST keeps a tiny 8-block LRU for point reads.
   A global, size-bounded cache would help large working sets.
 - **RocksDB comparison**: run the same YCSB mix against RocksDB on the same box.

@@ -7,7 +7,8 @@
 > fsync semantics, so I wrote my own LSM."_
 
 [![ci](https://github.com/Bunty9/driftdb/actions/workflows/ci.yml/badge.svg)](https://github.com/Bunty9/driftdb/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/badge/crates.io-pending-lightgrey.svg)](#)
+[![crates.io](https://img.shields.io/crates/v/driftdb-lsm.svg)](https://crates.io/crates/driftdb-lsm)
+[![docs.rs](https://img.shields.io/docsrs/driftdb-lsm)](https://docs.rs/driftdb-lsm)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 ## The problem
@@ -279,8 +280,13 @@ Embed into a downstream crate:
 
 ```toml
 [dependencies]
-driftdb = { path = "../driftdb" }   # or version = "0.1" once published
+driftdb-lsm = "0.1"
 ```
+
+The package is named `driftdb-lsm` on crates.io, because `driftdb` belongs to an
+unrelated project. The library is still imported as `driftdb`. It requires Rust
+1.85+ and runs on Linux only: the WAL uses `fdatasync(2)` and the directory lock
+uses `flock(2)`.
 
 ```rust
 use driftdb::{Db, Options, WriteBatch};
@@ -391,3 +397,7 @@ Dual-licensed under either of
   <https://opensource.org/licenses/MIT>)
 
 at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.

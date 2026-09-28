@@ -29,7 +29,7 @@
 //! input (it can panic or allocate wildly instead) — the checksum turns both into an ordinary
 //! `Error::SstCorrupt` instead.
 //!
-//! Each [`SstReader`] keeps a tiny per-table LRU of decompressed blocks (see [`BlockCache`])
+//! Each [`SstReader`] keeps a tiny per-table LRU of decompressed blocks (see `BlockCache`)
 //! so a hot key under a skewed (Zipfian) read workload doesn't pay zstd-decode on every single
 //! `get()`. Blocks are immutable once written, so the cache never needs invalidation.
 

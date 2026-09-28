@@ -7,7 +7,21 @@
 //! reads; a single dedicated writer thread group-commits batches to the WAL, and a single
 //! background thread owns flush + leveled compaction.
 //!
-//! See `docs/plans/2026-09-25-driftdb-phase-2.md` for the full design.
+//! Internals (threads, locks, recovery, invariants) are documented in
+//! [ARCHITECTURE.md](https://github.com/Bunty9/driftdb/blob/main/docs/ARCHITECTURE.md);
+//! on-disk formats in the [README](https://github.com/Bunty9/driftdb#on-disk-formats).
+//!
+//! ## Installation
+//!
+//! The crate is published as `driftdb-lsm` (the `driftdb` name on crates.io belongs to an
+//! unrelated project), but the library is imported as `driftdb`:
+//!
+//! ```toml
+//! [dependencies]
+//! driftdb-lsm = "0.1"
+//! ```
+//!
+//! Linux only for now: the WAL uses `fdatasync(2)` and the directory lock uses `flock(2)`.
 //!
 //! ## Quick start
 //!
@@ -26,6 +40,12 @@
 
 #![deny(rust_2018_idioms)]
 #![warn(missing_debug_implementations)]
+
+// The WAL relies on `fdatasync(2)` and the directory lock on `flock(2)`. macOS has no
+// `fdatasync` (it would need `fcntl(F_FULLFSYNC)`) and Windows has neither, so fail with a
+// readable message instead of an unresolved-import error from deep inside `libc`.
+#[cfg(not(target_os = "linux"))]
+compile_error!("driftdb currently supports Linux only (it needs fdatasync(2) and flock(2)).");
 
 pub mod compaction;
 pub mod db;
