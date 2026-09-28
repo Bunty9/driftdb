@@ -85,7 +85,7 @@ torn-tail garbage and truncated on replay.
   +-----------------+
 ```
 
-`format_version` is the SST format version (currently `1`). `SstReader::open` rejects any
+`format_version` is the SST format version (currently `1`). Opening an SST rejects any
 other value with `Error::UnsupportedFormat` rather than guessing at a layout it doesn't know.
 
 Each data-block entry (inside the decompressed block):
@@ -125,7 +125,7 @@ to prevent unbounded growth — only the live SST set plus the file-number alloc
 `FormatVersion` are carried forward.
 
 `FormatVersion(u32)` records the on-disk format version (currently `1`, shared with the
-SST footer's `format_version`). `Manifest::open` checks it as each frame replays — before
+SST footer's `format_version`). `Db::open` checks it as each manifest frame replays — before
 reading any later frame, doing the snapshot rewrite, or touching any WAL/SST — and refuses
 with `Error::UnsupportedFormat` on a mismatch, leaving the directory untouched. A manifest
 with no `FormatVersion` record at all (written before this field existed) is treated as
@@ -228,8 +228,7 @@ latency:
 one WAL file, and the writer stalls while two frozen memtables are waiting to
 flush. So a crash leaves at most about `memtable_size × 3` of WAL to replay,
 plus one group-commit batch per memtable. That is about 12 MiB with the
-default options, and the WAL can never grow to gigabytes. The original
-"10 GB WAL in < 5 s" target does not arise with this design.
+default options, and the WAL can never grow to gigabytes.
 
 No RocksDB comparison has been run yet; see `PROGRESS.md`.
 

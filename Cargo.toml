@@ -42,7 +42,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 # `oneshot`.
 tokio = { version = "1.47", features = ["sync", "rt"] }
 
-# Concurrent memtable (lock-free skiplist) — the canonical pick from `backend-cloud-roadmap.md` § 3.
+# Concurrent memtable (lock-free skiplist).
 crossbeam-skiplist = "0.1"
 
 # Block compression for SSTable data blocks. Level 3 is the LevelDB/RocksDB default.

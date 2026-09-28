@@ -13,7 +13,7 @@
 //! `target_file_size`, but only at a user-key boundary (never splitting versions of one key
 //! across files).
 //!
-//! Defense (the interview answer):
+//! Rationale:
 //!   - Leveled gives `O(log N)` reads + low space amp; cost is write amplification ~5-10x.
 //!   - For driftdb's intended embed targets (job-queue metadata, agent state), reads dominate;
 //!     leveled wins.

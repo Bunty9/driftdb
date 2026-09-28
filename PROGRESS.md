@@ -1,8 +1,6 @@
 # PROGRESS — driftdb
 
-> Per-sprint tracker. Template adapted from `project-plan.md` § 7,
-> customised for P5 (driftdb) bench targets and the Phase B sequencing
-> in `backend-cloud-roadmap.md` § 2 (weeks 31–38).
+> Development tracker: what is done, what is next, and the benchmark targets.
 
 ## Done — Phase 1 scaffold
 
@@ -61,8 +59,7 @@
 - **Replication stretch (openraft)**: add multi-node consensus so driftdb can be
   embedded as a replicated state machine. (Out of scope for Phase 2.)
 - **Blog post**: "I built a tiny LSM and benchmarked it against RocksDB" — document
-  design tradeoffs, crash semantics, and performance profiles. (Phase 2 stretch,
-  per `projects-l3-l4.md` § P5.)
+  design tradeoffs, crash semantics, and performance profiles. (Phase 2 stretch.)
 
 ## Bench numbers (`cargo bench --bench report`, i5-9300H + NVMe, shared box)
 
