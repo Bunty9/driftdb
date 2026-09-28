@@ -1,14 +1,16 @@
 //! Error type and shared `Result` alias for the public API.
 //!
 //! The crate uses `thiserror` for the library surface so callers can pattern-match on
-//! variants. The boundary contract: I/O errors (`std::io::Error`) and bincode serialization
-//! errors (`bincode::Error`) are wrapped through `#[from]`. WAL corruption is *not* one of
-//! those variants: a bad CRC, an invalid kind byte, or a header/body that runs off the end of
-//! the file is always treated as a torn tail from a mid-write crash (see `wal.rs`'s module
-//! docs) and silently truncated away on replay rather than surfaced as an error. Manifest
-//! corruption gets the stricter treatment — a `ManifestCorrupt` variant — because only a torn
-//! *tail* frame is dropped that way; the same corruption in the middle of the log is a real
-//! error (see `manifest.rs`'s module docs).
+//! variants. The boundary contract: only `std::io::Error` is wrapped through `#[from]` — no
+//! third-party error type appears in the public API (in particular, bincode's `Error` type is
+//! never exposed; a bincode failure is always mapped to `ManifestCorrupt` or `SstCorrupt` at
+//! the call site, since bincode is only ever used to decode the manifest log or an SST's
+//! index/bloom region). WAL corruption is *not* one of those variants: a bad CRC, an invalid
+//! kind byte, or a header/body that runs off the end of the file is always treated as a torn
+//! tail from a mid-write crash (see `wal.rs`'s module docs) and silently truncated away on
+//! replay rather than surfaced as an error. Manifest corruption gets the stricter treatment —
+//! a `ManifestCorrupt` variant — because only a torn *tail* frame is dropped that way; the same
+//! corruption in the middle of the log is a real error (see `manifest.rs`'s module docs).
 
 use thiserror::Error;
 
@@ -23,17 +25,14 @@ pub enum Error {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
-    /// Manifest log replay encountered an unknown record kind, a truncated record, or a
-    /// version mismatch.
+    /// Manifest log replay encountered an unknown record kind or a truncated/corrupt record.
+    /// A format-version mismatch is reported as [`Error::UnsupportedFormat`] instead.
     #[error("manifest corrupt: {0}")]
     ManifestCorrupt(String),
 
-    /// bincode (de)serialization failed — used by the manifest log and the SSTable footer.
-    #[error("bincode: {0}")]
-    Bincode(#[from] bincode::Error),
-
     /// SSTable file failed validation on open or during a block read: truncated file, bad
-    /// magic/footer offsets, a block that failed its CRC check, or a malformed index/bloom.
+    /// magic/footer offsets, a block that failed its CRC check, or a malformed index/bloom. A
+    /// format-version mismatch is reported as [`Error::UnsupportedFormat`] instead.
     #[error("sst corrupt: {0}")]
     SstCorrupt(String),
 

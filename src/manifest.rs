@@ -282,7 +282,8 @@ impl Manifest {
 
 /// Encode one edit as `[u32 BE len][u32 BE crc32(payload)][payload]`.
 pub fn encode_edit(edit: &[ManifestRecord]) -> Result<Vec<u8>> {
-    let payload = bincode::serialize(edit)?;
+    let payload = bincode::serialize(edit)
+        .map_err(|e| Error::ManifestCorrupt(format!("failed to encode edit: {e}")))?;
     let crc = crc32fast::hash(&payload);
     let mut out = Vec::with_capacity(8 + payload.len());
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
