@@ -31,6 +31,11 @@ use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 /// Engine tuning knobs. See each field for the default (matches the phase-2 plan).
+///
+/// New fields may be added in a minor (0.x) release. Construct with
+/// `Options { memtable_size: ..., ..Default::default() }` (or start from
+/// [`Options::default()`] and mutate individual fields) rather than a full struct literal, so
+/// adding a field there isn't a breaking change for callers.
 #[derive(Clone, Debug)]
 pub struct Options {
     /// Freeze the active memtable and roll to a new WAL once its approximate size reaches this.
@@ -82,35 +87,49 @@ pub struct WriteBatch {
 }
 
 impl WriteBatch {
+    /// An empty batch.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Queue a put. Builder-style: chain further `put`/`delete` calls.
     pub fn put(mut self, key: impl Into<Vec<u8>>, val: impl Into<Vec<u8>>) -> Self {
         self.ops.push((key.into(), Value::Put(val.into())));
         self
     }
 
+    /// Queue a tombstone write. Builder-style: chain further `put`/`delete` calls.
     pub fn delete(mut self, key: impl Into<Vec<u8>>) -> Self {
         self.ops.push((key.into(), Value::Delete));
         self
     }
 
+    /// True if no `put`/`delete` has been queued yet.
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
 
+    /// Number of queued ops.
     pub fn len(&self) -> usize {
         self.ops.len()
     }
 }
 
 /// Per-level file counts + byte totals, plus write-amplification inputs.
+///
+/// `#[non_exhaustive]`: new fields may be added in a minor (0.x) release; construct via
+/// [`Db::stats`] rather than a struct literal.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct Stats {
+    /// Number of live SST files per level, index 0 = L0.
     pub level_files: Vec<usize>,
+    /// Total SST bytes per level, index 0 = L0 (parallel to [`Stats::level_files`]).
     pub level_bytes: Vec<u64>,
+    /// Approximate bytes held by the active memtable plus any frozen ones waiting to flush.
     pub memtable_bytes: u64,
+    /// Total user key+value bytes ever written (the numerator/denominator base for
+    /// [`Stats::write_amplification`]; not reduced by deletes or compaction).
     pub user_bytes_written: u64,
     /// Bytes written to SST files by flushes and compactions combined (not the WAL -- see
     /// [`Stats::wal_bytes_written`]).
@@ -156,14 +175,18 @@ impl std::fmt::Debug for Snapshot {
 }
 
 impl Snapshot {
+    /// The seqno this snapshot reads at (every write acked at or before this seqno is visible;
+    /// nothing after it is).
     pub fn seq(&self) -> u64 {
         self.seq
     }
 
+    /// Point lookup at this snapshot's seqno.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.inner.get_at(key, self.seq)
     }
 
+    /// Range scan at this snapshot's seqno.
     pub fn scan<R: RangeBounds<Vec<u8>>>(&self, range: R) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.inner.scan_at(range, self.seq)
     }
