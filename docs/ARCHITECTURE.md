@@ -301,9 +301,10 @@ Briefly — the README and each module's header own the exact layouts:
   frame on every `Manifest::open`.
 - **Format version**: `FORMAT_VERSION` (`lib.rs`) is shared by the manifest's
   `ManifestRecord::FormatVersion` and the SST footer's `format_version` field.
-  `Manifest::open` checks it before doing anything else — no rewrite, no WAL
-  replay, no deletions — and refuses with `Error::UnsupportedFormat` on a
-  mismatch; `SstReader::open` does the same per-file with `Error::SstCorrupt`.
+  `Manifest::open` checks it as each frame replays — before doing anything
+  else with the rest of the log, and before any rewrite, WAL replay, or
+  deletion — and refuses with `Error::UnsupportedFormat` on a mismatch;
+  `SstReader::open` does the same per-file, also with `Error::UnsupportedFormat`.
 
 See the README's "On-disk formats" section for full field layouts, and its
 "Design tradeoffs" for `fdatasync` vs `fsync`, the MVCC GC watermark, and

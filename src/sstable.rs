@@ -19,8 +19,8 @@
 //! ```
 //!
 //! `format_version` is [`crate::FORMAT_VERSION`], written by every [`SstWriter::finish`].
-//! [`SstReader::open`] rejects any other value with [`Error::SstCorrupt`] rather than trying to
-//! read a layout it doesn't understand.
+//! [`SstReader::open`] rejects any other value with [`Error::UnsupportedFormat`] rather than
+//! trying to read a layout it doesn't understand.
 //!
 //! Each data block entry: `[u32 BE klen][u32 BE vlen][u64 BE seq][u8 kind][key][val]`
 //! where `kind` is 1 for Put and 0 for Delete (the val bytes are absent for Delete).
@@ -55,7 +55,7 @@ pub const SSTABLE_MAGIC: u64 = 0xDEAD_BEEF;
 pub const BLOOM_FPR: f64 = 0.01;
 /// Bloom initial capacity hint — the filter grows past this if needed.
 pub const BLOOM_CAPACITY: usize = 100_000;
-/// Length of the fixed footer: `index_off (8) + bloom_off (8) + crc32 (4) + reserved (4) +
+/// Length of the fixed footer: `index_off (8) + bloom_off (8) + crc32 (4) + format_version (4) +
 /// magic (8)`.
 const FOOTER_LEN: u64 = 32;
 /// Length of one data-block header: `compressed_len (4) + crc32 (4)`.
@@ -357,11 +357,10 @@ impl SstReader {
             )));
         }
         if format_version != crate::FORMAT_VERSION {
-            return Err(Error::SstCorrupt(format!(
-                "{}: unsupported SST format version {format_version} (supported: {})",
-                path.display(),
-                crate::FORMAT_VERSION
-            )));
+            return Err(Error::UnsupportedFormat {
+                found: format_version,
+                supported: crate::FORMAT_VERSION,
+            });
         }
         if !(index_off <= bloom_off && bloom_off <= footer_start) {
             return Err(Error::SstCorrupt(format!(
@@ -823,13 +822,16 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let err = SstReader::open(&path).unwrap_err();
-        match &err {
-            Error::SstCorrupt(msg) => assert!(
-                msg.contains("unsupported") && msg.contains("version"),
-                "got {msg:?}"
+        assert!(
+            matches!(
+                err,
+                Error::UnsupportedFormat {
+                    found,
+                    supported,
+                } if found == crate::FORMAT_VERSION + 1 && supported == crate::FORMAT_VERSION
             ),
-            other => panic!("got {other:?}"),
-        }
+            "got {err:?}"
+        );
     }
 
     #[test]

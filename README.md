@@ -91,7 +91,7 @@ torn-tail garbage and truncated on replay.
 ```
 
 `format_version` is the SST format version (currently `1`). `SstReader::open` rejects any
-other value with `Error::SstCorrupt` rather than guessing at a layout it doesn't know.
+other value with `Error::UnsupportedFormat` rather than guessing at a layout it doesn't know.
 
 Each data-block entry (inside the decompressed block):
 
@@ -130,10 +130,11 @@ to prevent unbounded growth — only the live SST set plus the file-number alloc
 `FormatVersion` are carried forward.
 
 `FormatVersion(u32)` records the on-disk format version (currently `1`, shared with the
-SST footer's `format_version`). `Manifest::open` checks it — before doing the snapshot
-rewrite or touching any WAL/SST — and refuses with `Error::UnsupportedFormat` on a
-mismatch, leaving the directory untouched. A manifest with no `FormatVersion` record at
-all (written before this field existed) is treated as version 1.
+SST footer's `format_version`). `Manifest::open` checks it as each frame replays — before
+reading any later frame, doing the snapshot rewrite, or touching any WAL/SST — and refuses
+with `Error::UnsupportedFormat` on a mismatch, leaving the directory untouched. A manifest
+with no `FormatVersion` record at all (written before this field existed) is treated as
+version 1.
 
 ## Design tradeoffs
 
