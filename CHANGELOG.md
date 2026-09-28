@@ -7,7 +7,7 @@ bump (`0.1` to `0.2`) may break the API **or the on-disk format**.
 
 ## [Unreleased]
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-09-28
 
 First public release, published as `driftdb-lsm` and imported as `driftdb`.
 
@@ -41,7 +41,16 @@ First public release, published as `driftdb-lsm` and imported as `driftdb`.
   `MAX_VALUE_LEN` are public; the `wal`/`sstable`/`manifest`/`memtable`/
   `iter`/`compaction`/`db`/`error` modules are internal. `Error` and
   `Stats` are `#[non_exhaustive]`.
+- `Options` validation: `Db::open`/`open_with` rejects out-of-range field
+  values with `Error::InvalidArgument` before touching the directory.
+- `Error::UnsupportedFormat` is now also returned for an SST footer with an
+  unsupported `format_version` (previously `Error::SstCorrupt`), and the
+  manifest's format-version check now fires as soon as it replays an
+  unsupported version, before decoding any later frame.
 
 ### Platform
 
 - Linux only. Minimum supported Rust version is 1.85.
+
+[Unreleased]: https://github.com/Bunty9/driftdb/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Bunty9/driftdb/releases/tag/v0.1.0
