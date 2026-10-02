@@ -140,9 +140,10 @@ Errors use a store error enum (`thiserror`): `NotFound`, `InvalidState`,
    "crashes": it claims a job and never completes it. The demo then advances
    time and calls `requeue_expired` to recover the job.
 4. Mid-run, print `report()` while workers keep writing.
-5. After workers drain: purge `Done`, run `maintenance()`, print levels and
-   write amplification before and after.
-6. `export` a JSONL backup and print its line count.
+5. After workers drain: `export` a JSONL backup of every job from a snapshot
+   and print its line count.
+6. Purge `Done`, run `maintenance()`, and print levels and write
+   amplification before and after.
 7. `close()`, reopen, and assert the report counts are unchanged.
 
 **`crash-demo [--dir D]`** re-execs itself with a hidden `crash-child`
