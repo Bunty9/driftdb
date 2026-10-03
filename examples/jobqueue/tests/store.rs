@@ -281,3 +281,61 @@ async fn stale_worker_is_fenced_off() {
     );
     store.close().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_report_ignores_later_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JobStore::open(dir.path(), small_opts()).await.unwrap();
+    for n in 0..20 {
+        store.enqueue(new_job(n), n).await.unwrap();
+    }
+    let snap = store.db().snapshot();
+    let before = store.report().await.unwrap();
+    for n in 20..40 {
+        store.enqueue(new_job(n), n).await.unwrap();
+    }
+    store.claim(1_000, 100).await.unwrap();
+    store.db().flush().await.unwrap();
+    let at_snap = store.report_at(snap).await.unwrap();
+    assert_eq!(
+        at_snap.counts, before.counts,
+        "a snapshot sees exactly the state it was taken at"
+    );
+    assert_eq!(at_snap.counts["pending"], 20);
+    assert_eq!(at_snap.oldest_pending.as_ref().map(|j| j.id), Some(1));
+    let now = store.report().await.unwrap();
+    assert_eq!((now.counts["pending"], now.counts["running"]), (39, 1));
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn export_purge_and_maintenance() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JobStore::open(dir.path(), small_opts()).await.unwrap();
+    for n in 0..100 {
+        store.enqueue(new_job(n), 10).await.unwrap();
+    }
+    for _ in 0..60 {
+        let j = store.claim(1_000, 20).await.unwrap().unwrap();
+        store.complete(j.id, j.claim_token, 30).await.unwrap();
+    }
+    let out = dir.path().join("backup.jsonl");
+    assert_eq!(store.export(&out).await.unwrap(), 100);
+    let lines = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(lines.lines().count(), 100);
+    let first: Job = serde_json::from_str(lines.lines().next().unwrap()).unwrap();
+    assert_eq!(first.id, 1);
+
+    assert_eq!(
+        store.purge(JobStatus::Done, 30).await.unwrap(),
+        0,
+        "older_than is exclusive"
+    );
+    assert_eq!(store.purge(JobStatus::Done, 31).await.unwrap(), 60);
+    let (before, after) = store.maintenance().await.unwrap();
+    assert!(before.user_bytes_written > 0);
+    assert_eq!(after.memtable_bytes, 0, "maintenance flushes the memtable");
+    let report = store.report().await.unwrap();
+    assert_eq!((report.counts["done"], report.counts["pending"]), (0, 40));
+    store.close().await.unwrap();
+}

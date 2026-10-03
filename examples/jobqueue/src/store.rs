@@ -11,9 +11,13 @@
 //!   ponytail: one global write lock caps write concurrency at "one RMW at a time"; shard
 //!   the lock by key (e.g. per queue) if that ever becomes the bottleneck.
 
-use crate::keys::{id_from_key, job_key, prefix_range, status_key, status_prefix, NEXT_ID_KEY};
-use crate::model::{Job, JobStatus, NewJob};
-use driftdb::{Db, Options, WriteBatch};
+use crate::keys::{
+    id_from_key, job_key, prefix_range, status_key, status_prefix, JOB_PREFIX, NEXT_ID_KEY,
+};
+use crate::model::{Job, JobStatus, NewJob, Report, StatsView};
+use driftdb::{Db, Options, Snapshot, WriteBatch};
+use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -239,6 +243,96 @@ impl JobStore {
 
     pub async fn close(&self) -> Result<()> {
         Ok(self.db.close().await?)
+    }
+
+    /// Consistent counts + oldest pending job, read from one snapshot while writers keep going.
+    pub async fn report(&self) -> Result<Report> {
+        self.report_at(self.db.snapshot()).await
+    }
+
+    /// `Snapshot::get`/`scan` are synchronous and may touch disk, so run them off the async
+    /// executor with `spawn_blocking` — the same reason `Db::scan` does internally.
+    pub async fn report_at(&self, snap: Snapshot) -> Result<Report> {
+        tokio::task::spawn_blocking(move || -> Result<Report> {
+            let mut counts = BTreeMap::new();
+            let mut oldest_pending = None;
+            for status in JobStatus::ALL {
+                let index = snap.scan(prefix_range(&status_prefix(status)))?;
+                if status == JobStatus::Pending {
+                    if let Some(id) = index.first().and_then(|(k, _)| id_from_key(k)) {
+                        if let Some(bytes) = snap.get(&job_key(id))? {
+                            oldest_pending = Some(serde_json::from_slice::<Job>(&bytes)?);
+                        }
+                    }
+                }
+                counts.insert(status.as_str().to_string(), index.len() as u64);
+            }
+            Ok(Report {
+                counts,
+                oldest_pending,
+                snapshot_seq: snap.seq(),
+            })
+        })
+        .await?
+    }
+
+    /// Write every job as one JSON line, from a snapshot (a consistent online backup).
+    /// Returns the number of jobs written.
+    pub async fn export(&self, path: impl AsRef<Path>) -> Result<usize> {
+        let snap = self.db.snapshot();
+        let path = path.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<usize> {
+            let records = snap.scan(prefix_range(JOB_PREFIX))?;
+            let mut out = std::io::BufWriter::new(std::fs::File::create(&path)?);
+            for (_, value) in &records {
+                out.write_all(value)?;
+                out.write_all(b"\n")?;
+            }
+            out.flush()?;
+            Ok(records.len())
+        })
+        .await?
+    }
+
+    /// Delete jobs in `status` last updated strictly before `older_than`. Deletes are
+    /// tombstones until compaction drops them (see `maintenance`).
+    pub async fn purge(&self, status: JobStatus, older_than: u64) -> Result<usize> {
+        let _guard = self.write.lock().await;
+        let index = self.db.scan(prefix_range(&status_prefix(status))).await?;
+        let mut batch = WriteBatch::new();
+        let mut purged = 0;
+        for (key, _) in index {
+            let Some(id) = id_from_key(&key) else {
+                continue;
+            };
+            let Some(job) = self.get(id).await? else {
+                continue;
+            };
+            if job.updated_at < older_than {
+                batch = batch.delete(key).delete(job_key(id));
+                purged += 1;
+                if batch.len() >= 1_000 {
+                    self.db.write_batch(std::mem::take(&mut batch)).await?;
+                }
+            }
+        }
+        if !batch.is_empty() {
+            self.db.write_batch(batch).await?;
+        }
+        Ok(purged)
+    }
+
+    /// Flush the memtable and run a full compaction (drops purged tombstones).
+    /// Returns stats before and after.
+    pub async fn maintenance(&self) -> Result<(StatsView, StatsView)> {
+        let before = self.stats();
+        self.db.flush().await?;
+        self.db.compact().await?;
+        Ok((before, self.stats()))
+    }
+
+    pub fn stats(&self) -> StatsView {
+        StatsView::from(&self.db.stats())
     }
 
     async fn owned_running_job(&self, id: u64, claim_token: u64) -> Result<Job> {
