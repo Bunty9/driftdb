@@ -362,6 +362,19 @@ cargo run --example quickstart
 # Opens /tmp/driftdb-demo, writes 1000 keys, reads them back, prints stats.
 ```
 
+## Examples
+
+`examples/jobqueue` is a reference integration: a durable job queue (typed store,
+secondary index, snapshot reports, backup, HTTP API, SIGKILL crash demo) built on
+`driftdb-lsm`. Its [README](examples/jobqueue/README.md) maps each engine feature to the
+code that uses it and lists the pitfalls. It is not published to crates.io.
+
+```bash
+cargo run -p jobqueue -- demo --jobs 300
+cargo run -p jobqueue -- crash-demo
+cargo run -p jobqueue -- serve --dir ./jobqueue-data --addr 127.0.0.1:3000
+```
+
 ## Repository layout
 
 ```
@@ -382,7 +395,7 @@ driftdb/
     crash_recovery.rs  reopen, torn WAL, orphan SSTs, flush failure, dir lock
     crash_kill.rs      SIGKILL a writer child process, verify every acked write
   benches/          report.rs, throughput.rs, ycsb.rs
-  examples/         quickstart.rs
+  examples/         quickstart.rs, jobqueue/ (reference job queue crate, see its README)
   docs/             ARCHITECTURE.md (internals guide), design spec, phase plans
 ```
 

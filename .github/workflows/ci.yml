@@ -49,7 +49,7 @@ jobs:
           toolchain: "1.85"
       - uses: Swatinem/rust-cache@v2
       - name: cargo check (lib) on rust-version
-        run: cargo check --lib
+        run: cargo check -p driftdb-lsm --lib
 
   docs:
     name: rustdoc + package
@@ -59,11 +59,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo doc (deny warnings, as docs.rs would render)
-        run: cargo doc --no-deps
+        run: cargo doc --no-deps -p driftdb-lsm
         env:
           RUSTDOCFLAGS: "-D warnings"
       - name: cargo publish --dry-run
-        run: cargo publish --dry-run
+        run: cargo publish -p driftdb-lsm --dry-run
+
+  example:
+    name: example (jobqueue)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt -p jobqueue --check
+      - run: cargo clippy -p jobqueue --all-targets -- -D warnings
+      - run: cargo test -p jobqueue
+      - run: cargo run -p jobqueue -- demo --jobs 300
+      - run: cargo run -p jobqueue -- crash-demo
 
   deny:
     name: cargo-deny

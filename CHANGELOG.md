@@ -7,6 +7,11 @@ bump (`0.1` to `0.2`) may break the API **or the on-disk format**.
 
 ## [Unreleased]
 
+### Added
+
+- `examples/jobqueue`: reference integration (typed store, secondary index, snapshots,
+  HTTP API, crash demo).
+
 ## [0.1.0] - 2026-09-28
 
 First public release, published as `driftdb-lsm` and imported as `driftdb`.
