@@ -790,6 +790,7 @@ git commit -m "feat(example): JobStore with atomic batches, secondary index, lea
 
 **Interfaces:**
 - Consumes: Task 2 `JobStore`, `StoreError`, `Result`.
+- Note (amended after Task 2 review): `Job` has `claim_token: u64`; `complete(id, claim_token, now)` / `fail(id, claim_token, error, now)`; `StoreError::LeaseLost { id }`.
 - Produces: `report(&self) -> Result<Report>`; `report_at(&self, snap: driftdb::Snapshot) -> Result<Report>`; `export(&self, path: impl AsRef<Path>) -> Result<usize>`; `purge(&self, status: JobStatus, older_than: u64) -> Result<usize>`; `maintenance(&self) -> Result<(StatsView, StatsView)>`; sync `stats(&self) -> StatsView`.
 
 - [ ] **Step 1: Append failing tests** to `tests/store.rs`:
@@ -827,7 +828,7 @@ async fn export_purge_and_maintenance() {
     }
     for _ in 0..60 {
         let j = store.claim(1_000, 20).await.unwrap().unwrap();
-        store.complete(j.id, 30).await.unwrap();
+        store.complete(j.id, j.claim_token, 30).await.unwrap();
     }
     let out = dir.path().join("backup.jsonl");
     assert_eq!(store.export(&out).await.unwrap(), 100);
@@ -1006,9 +1007,11 @@ async fn full_job_lifecycle_over_http() {
     assert_eq!((s, claimed["status"].as_str()), (StatusCode::OK, Some("running")));
     assert_eq!(call(&app, "POST", "/jobs/claim", Some(json!({"lease_ms": 30000}))).await.0, StatusCode::NO_CONTENT);
 
-    assert_eq!(call(&app, "POST", "/jobs/1/complete", None).await.0, StatusCode::OK);
-    assert_eq!(call(&app, "POST", "/jobs/1/complete", None).await.0, StatusCode::CONFLICT);
-    assert_eq!(call(&app, "POST", "/jobs/1/fail", Some(json!({"error": "x"}))).await.0, StatusCode::CONFLICT);
+    let token = claimed["claim_token"].clone();
+    assert_eq!(call(&app, "POST", "/jobs/1/complete", Some(json!({"claim_token": 999}))).await.0, StatusCode::CONFLICT, "stale token");
+    assert_eq!(call(&app, "POST", "/jobs/1/complete", Some(json!({"claim_token": token}))).await.0, StatusCode::OK);
+    assert_eq!(call(&app, "POST", "/jobs/1/complete", Some(json!({"claim_token": token}))).await.0, StatusCode::CONFLICT);
+    assert_eq!(call(&app, "POST", "/jobs/1/fail", Some(json!({"claim_token": token, "error": "x"}))).await.0, StatusCode::CONFLICT);
 
     let (s, done) = call(&app, "GET", "/jobs?status=done&limit=10", None).await;
     assert_eq!((s, done.as_array().map(Vec::len)), (StatusCode::OK, Some(1)));
@@ -1101,7 +1104,7 @@ impl IntoResponse for ApiError {
             ApiError::Store(e) => {
                 let status = match &e {
                     StoreError::NotFound(_) => StatusCode::NOT_FOUND,
-                    StoreError::InvalidState { .. } => StatusCode::CONFLICT,
+                    StoreError::InvalidState { .. } | StoreError::LeaseLost { .. } => StatusCode::CONFLICT,
                     StoreError::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
                     _ => {
                         tracing::error!(error = %e, "storage failure");
@@ -1159,17 +1162,25 @@ async fn claim(State(store): State<JobStore>, Json(body): Json<ClaimBody>) -> Ap
     })
 }
 
-async fn complete(State(store): State<JobStore>, Path(id): Path<u64>) -> ApiResult<Response> {
-    Ok(Json(store.complete(id, now_ms()).await?).into_response())
+/// Workers echo back the `claim_token` they got from `/jobs/claim` (fencing: a worker whose
+/// lease expired and whose job was re-claimed gets 409 instead of overwriting the new owner).
+#[derive(Deserialize)]
+struct CompleteBody {
+    claim_token: u64,
+}
+
+async fn complete(State(store): State<JobStore>, Path(id): Path<u64>, Json(body): Json<CompleteBody>) -> ApiResult<Response> {
+    Ok(Json(store.complete(id, body.claim_token, now_ms()).await?).into_response())
 }
 
 #[derive(Deserialize)]
 struct FailBody {
+    claim_token: u64,
     error: String,
 }
 
 async fn fail(State(store): State<JobStore>, Path(id): Path<u64>, Json(body): Json<FailBody>) -> ApiResult<Response> {
-    Ok(Json(store.fail(id, body.error, now_ms()).await?).into_response())
+    Ok(Json(store.fail(id, body.claim_token, body.error, now_ms()).await?).into_response())
 }
 
 async fn report(State(store): State<JobStore>) -> ApiResult<Response> {
@@ -1325,10 +1336,10 @@ async fn demo(dir: PathBuf, jobs: u64) -> anyhow::Result<()> {
             loop {
                 match store.claim(30_000, now_ms()).await? {
                     Some(job) if job.payload["fail"] == true => {
-                        store.fail(job.id, "simulated failure".into(), now_ms()).await?;
+                        store.fail(job.id, job.claim_token, "simulated failure".into(), now_ms()).await?;
                     }
                     Some(job) => {
-                        store.complete(job.id, now_ms()).await?;
+                        store.complete(job.id, job.claim_token, now_ms()).await?;
                         processed += 1;
                     }
                     None if producers_done.load(Ordering::Acquire) => break,
@@ -1356,7 +1367,13 @@ async fn demo(dir: PathBuf, jobs: u64) -> anyhow::Result<()> {
     step(5, "the crashed worker's lease expires; requeue_expired puts its job back");
     let requeued = store.requeue_expired(now_ms() + 2_000).await?;
     let job = store.claim(30_000, now_ms()).await?.context("requeued job")?;
-    store.complete(job.id, now_ms()).await?;
+    store.complete(job.id, job.claim_token, now_ms()).await?;
+    // The crashed worker wakes up and tries to finish the job it lost: fenced off.
+    let stale = store.complete(orphan.id, orphan.claim_token, now_ms()).await;
+    if !matches!(stale, Err(jobqueue::store::StoreError::LeaseLost { .. })) {
+        bail!("stale worker was not fenced off: {stale:?}");
+    }
+    println!("    the crashed worker's late complete() was rejected: LeaseLost (fencing token)");
     println!("    requeued {requeued} job(s); job {} finished by another worker", job.id);
 
     let report = store.report().await?;
@@ -1506,7 +1523,7 @@ Run: `cargo run -p jobqueue -- serve --dir /tmp/claude-jq-serve --addr 127.0.0.1
   1. *What this is* — durable job queue, how to run the three subcommands (commands from Step 2) and sample `demo` output (paste a real run).
   2. *Using driftdb in your project* — the `Cargo.toml` line (`driftdb-lsm = "0.1"`, imported as `driftdb`), Linux-only, Rust 1.85+ for the library.
   3. *Feature → code map* — table: Options/open errors → `JobStore::open`; atomic multi-key write → `enqueue`, `move_batch`; secondary index + prefix scan → `keys.rs`, `list`; read-modify-write safety → the `write` mutex; snapshots → `report_at`, `export`; deletes/tombstones/compaction → `purge`, `maintenance`; stats → `StatsView`; graceful shutdown → `serve` + `close`; crash safety → `crash-demo`.
-  4. *Patterns and pitfalls* — (a) design keys for byte order (fixed-width ids); (b) put record + index in one batch; (c) no CAS: serialize RMW or shard locks, never read-then-write unguarded; (d) `Snapshot::get/scan` are sync → `spawn_blocking`; (e) `scan` returns a `Vec` — bound your ranges; (f) one process per directory (`Locked`); (g) call `close().await` on shutdown, dropping the last handle also works but blocks; (h) deletes are tombstones until compaction.
+  4. *Patterns and pitfalls* — (a) design keys for byte order (fixed-width ids); (b) put record + index in one batch; (c) no CAS: serialize RMW or shard locks, never read-then-write unguarded; fence workers with a claim token so a worker whose lease expired cannot finish a job someone else re-claimed; (d) `Snapshot::get/scan` are sync → `spawn_blocking`; (e) `scan` returns a `Vec` — bound your ranges; (f) one process per directory (`Locked`); (g) call `close().await` on shutdown, dropping the last handle also works but blocks; (h) deletes are tombstones until compaction.
   5. *HTTP API* — route table from the spec + curl examples.
 
 - [ ] **Step 4: CI** — in `.github/workflows/ci.yml`:
