@@ -75,6 +75,8 @@ publish from a local machine.
 
 ### Per release
 
+Never create or push a `v*` tag without the owner's explicit go-ahead: the tag push publishes to crates.io, and a published version can only be yanked, never replaced.
+
 1. Bump `version` in `Cargo.toml` (the `driftdb-lsm` package).
 2. In `CHANGELOG.md`, move the `[Unreleased]` items under
    `## [X.Y.Z] - YYYY-MM-DD` and update the compare links at the bottom.

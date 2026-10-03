@@ -14,7 +14,7 @@ Packaging facts:
 - **Name:** published as `driftdb-lsm`, because `driftdb` on crates.io is an unrelated crate. `[lib] name = "driftdb"` keeps the import path `use driftdb::…`.
 - **MSRV:** 1.85 (`rust-version`, checked by CI's msrv job).
 - **Platform:** Linux only; `lib.rs` has a `compile_error!` for other targets.
-- **Releases:** cut by pushing a `vX.Y.Z` tag. `.github/workflows/release.yml` publishes via crates.io trusted publishing (OIDC, no stored token). Never publish locally. Procedure: `docs/plans/2026-09-28-publishing.md`. 0.1.0 shipped 2026-09-28; a published version can only be yanked, never replaced.
+- **Releases:** cut by pushing a `vX.Y.Z` tag. `.github/workflows/release.yml` publishes via crates.io trusted publishing (OIDC, no stored token). Never publish locally. Never create or push a `v*` tag without the owner's explicit go-ahead: the tag push publishes to crates.io, and a published version can only be yanked, never replaced. Procedure: `docs/plans/2026-09-28-publishing.md`. 0.1.0 shipped 2026-09-28.
 - **Public API:** `Db`, `Options`, `Snapshot`, `Stats`, `WriteBatch`, `Error` (`#[non_exhaustive]`), `Result`, `MAX_KEY_LEN` and `MAX_VALUE_LEN`. All modules are private; `#[doc(hidden)] __bench` exists only for benches. Adding a `pub` item is a semver commitment.
 - **On-disk format:** `FORMAT_VERSION` in `lib.rs` is written to the manifest and the SST footer. Bump it on any layout change. A future format must write a standalone `FormatVersion` manifest frame first, so older builds refuse the directory cleanly.
 
