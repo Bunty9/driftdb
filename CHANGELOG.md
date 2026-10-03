@@ -7,6 +7,8 @@ bump (`0.1` to `0.2`) may break the API **or the on-disk format**.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-03
+
 ### Added
 
 - `examples/jobqueue`: reference integration of a durable job queue (typed store, secondary
@@ -64,5 +66,6 @@ First public release, published as `driftdb-lsm` and imported as `driftdb`.
 
 - Linux only. Minimum supported Rust version is 1.85.
 
-[Unreleased]: https://github.com/Bunty9/driftdb/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Bunty9/driftdb/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Bunty9/driftdb/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Bunty9/driftdb/releases/tag/v0.1.0

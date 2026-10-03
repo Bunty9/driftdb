@@ -2,7 +2,7 @@
 # `driftdb` is taken on crates.io (an unrelated real-time backend), so the package is
 # published as `driftdb-lsm`; the library keeps the `driftdb` import path (see [lib]).
 name = "driftdb-lsm"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Bunty9 <Bunty9@users.noreply.github.com>"]
