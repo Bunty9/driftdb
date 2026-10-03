@@ -40,7 +40,7 @@ pub enum StoreError {
     },
     #[error("job {id} was re-claimed by another worker (stale claim_token)")]
     LeaseLost { id: u64 },
-    #[error("payload is {size} bytes; the limit is {limit}")]
+    #[error("job record is {size} bytes; the limit is {limit}")]
     PayloadTooLarge { size: usize, limit: usize },
     #[error("{}", describe_db_error(.0))]
     Db(#[from] driftdb::Error),
@@ -192,8 +192,8 @@ impl JobStore {
         Ok(job)
     }
 
-    /// Return `running` jobs whose lease ended at or before `now` to `pending` (their worker
-    /// died). All moves go in one batch.
+    /// Move `running` jobs whose lease ended at or before `now` back to `pending` (their worker
+    /// died), or to `dead` once the expiry exhausts `max_attempts`. All moves go in one batch.
     pub async fn requeue_expired(&self, now: u64) -> Result<usize> {
         let _guard = self.write.lock().await;
         let running = self
@@ -209,7 +209,13 @@ impl JobStore {
                 continue;
             };
             if job.lease_until.is_some_and(|until| until <= now) {
-                job.status = JobStatus::Pending;
+                // A lease that expires is a failed attempt, so a crash-looping job dead-letters.
+                job.attempts += 1;
+                job.status = if job.attempts >= job.max_attempts {
+                    JobStatus::Dead
+                } else {
+                    JobStatus::Pending
+                };
                 job.lease_until = None;
                 job.last_error = Some("lease expired".into());
                 job.updated_at = now;
@@ -289,6 +295,7 @@ impl JobStore {
                 out.write_all(b"\n")?;
             }
             out.flush()?;
+            out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
             Ok(records.len())
         })
         .await?

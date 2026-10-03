@@ -130,7 +130,31 @@ async fn expired_lease_is_requeued() {
     assert_eq!(store.requeue_expired(1_100).await.unwrap(), 1);
     let j = store.get(1).await.unwrap().unwrap();
     assert_eq!((j.status, j.lease_until), (JobStatus::Pending, None));
+    assert_eq!(j.attempts, 1);
     assert_eq!(j.last_error.as_deref(), Some("lease expired"));
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn repeated_lease_expiry_dead_letters() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JobStore::open(dir.path(), Options::default())
+        .await
+        .unwrap();
+    let mut new = new_job(1);
+    new.max_attempts = Some(2);
+    store.enqueue(new, 0).await.unwrap();
+    store.claim(100, 1_000).await.unwrap().unwrap();
+    assert_eq!(store.requeue_expired(1_100).await.unwrap(), 1);
+    assert_eq!(
+        store.get(1).await.unwrap().unwrap().status,
+        JobStatus::Pending
+    );
+    store.claim(100, 1_200).await.unwrap().unwrap();
+    assert_eq!(store.requeue_expired(1_300).await.unwrap(), 1);
+    let j = store.get(1).await.unwrap().unwrap();
+    assert_eq!((j.status, j.attempts), (JobStatus::Dead, 2));
+    assert!(store.claim(100, 1_400).await.unwrap().is_none());
     store.close().await.unwrap();
 }
 
@@ -274,7 +298,7 @@ async fn stale_worker_is_fenced_off() {
         Err(StoreError::LeaseLost { id: 1 })
     ));
     let j = store.get(1).await.unwrap().unwrap();
-    assert_eq!((j.status, j.attempts), (JobStatus::Running, 0));
+    assert_eq!((j.status, j.attempts), (JobStatus::Running, 1));
     assert_eq!(
         store.complete(1, b, 1_400).await.unwrap().status,
         JobStatus::Done

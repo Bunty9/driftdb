@@ -164,6 +164,8 @@ async fn demo((dir, owned): (PathBuf, bool), jobs: u64) -> anyhow::Result<()> {
         workers.push(tokio::spawn(async move {
             let mut processed = 0u64;
             loop {
+                // Read the flag before claiming: a job enqueued after an empty claim must not be missed.
+                let done = producers_done.load(Ordering::Acquire);
                 match store.claim(30_000, now_ms()).await? {
                     Some(job) if job.payload["fail"] == true => {
                         store
@@ -179,7 +181,7 @@ async fn demo((dir, owned): (PathBuf, bool), jobs: u64) -> anyhow::Result<()> {
                         store.complete(job.id, job.claim_token, now_ms()).await?;
                         processed += 1;
                     }
-                    None if producers_done.load(Ordering::Acquire) => break,
+                    None if done => break,
                     None => tokio::time::sleep(Duration::from_millis(2)).await,
                 }
             }
@@ -250,12 +252,16 @@ async fn demo((dir, owned): (PathBuf, bool), jobs: u64) -> anyhow::Result<()> {
     let (before, after) = store.maintenance().await?;
     println!("    purged {purged}");
     println!(
-        "    before: files per level {:?}, write amp {:.2}x",
-        before.level_files, before.write_amplification
+        "    before: files per level {:?}, {} SST bytes, write amp {:.2}x",
+        before.level_files,
+        before.level_bytes.iter().sum::<u64>(),
+        before.write_amplification
     );
     println!(
-        "    after:  files per level {:?}, write amp {:.2}x",
-        after.level_files, after.write_amplification
+        "    after:  files per level {:?}, {} SST bytes, write amp {:.2}x",
+        after.level_files,
+        after.level_bytes.iter().sum::<u64>(),
+        after.write_amplification
     );
 
     step(8, "close, reopen, and check nothing changed (recovery)");
@@ -306,6 +312,9 @@ async fn crash_demo((dir, owned): (PathBuf, bool)) -> anyhow::Result<()> {
     });
     let started = Instant::now();
     tokio::time::sleep(Duration::from_millis(1_000)).await;
+    if let Some(status) = child.try_wait()? {
+        bail!("child exited before the kill: {status}");
+    }
     child.kill()?; // SIGKILL: no destructors, no flush, no close()
     child.wait()?;
     let acked = reader.join().expect("reader thread");
@@ -403,7 +412,13 @@ async fn serve(dir: PathBuf, addr: SocketAddr) -> anyhow::Result<()> {
     tracing::info!(%addr, dir = %dir.display(), "jobqueue listening");
     axum::serve(listener, api::router(store.clone()))
         .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("install SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
             tracing::info!("shutting down");
         })
         .await?;
