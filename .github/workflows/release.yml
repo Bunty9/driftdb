@@ -1,0 +1,44 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: publish driftdb-lsm to crates.io (trusted publishing)
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write   # OIDC token exchanged for a short-lived crates.io token
+      contents: write   # create the GitHub release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tag must match Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "driftdb-lsm") | .version')
+          if [ "$tag" != "$ver" ]; then echo "tag v$tag does not match Cargo.toml version $ver"; exit 1; fi
+      - name: Tests
+        run: cargo test -p driftdb-lsm
+      - name: Dry run
+        run: cargo publish -p driftdb-lsm --dry-run
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish
+        run: cargo publish -p driftdb-lsm
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - name: GitHub release from CHANGELOG
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          awk -v v="$ver" 'index($0, "## [" v "]") == 1 {f=1; next} /^## \[/ {if (f) exit} /^\[/ {if (f) exit} f' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "no CHANGELOG section for $ver"; exit 1; }
+          gh release create "$GITHUB_REF_NAME" --title "driftdb-lsm $ver" --notes-file notes.md

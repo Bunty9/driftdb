@@ -55,37 +55,42 @@ item is covered by semver.
 4. **Fill in the CHANGELOG date** when tagging (`## [0.1.0] - YYYY-MM-DD`), and
    add compare links.
 
-## Release procedure
+## Releasing (trusted publishing)
 
-1. On a branch, land blockers 1–3. Wait for green CI: tests on stable and beta,
-   msrv, rustdoc + package, cargo-deny.
-2. Bump nothing (the version is already 0.1.0). Date the CHANGELOG entry and
-   commit it.
-3. **(owner)** Run `cargo login` with a crates.io API token scoped to
-   `publish-new` and `publish-update` for `driftdb-lsm`. The token is the
-   owner's; do not store it in the repo.
-4. `cargo publish --dry-run`, then **(owner)** `cargo publish`.
-5. Tag and release: `git tag -a v0.1.0 -m "driftdb-lsm 0.1.0"`, then
-   `git push origin v0.1.0`. Then
-   `gh release create v0.1.0 --notes-from-tag` or paste the CHANGELOG section.
-6. Verify:
-   - <https://crates.io/crates/driftdb-lsm> renders the README.
-   - <https://docs.rs/driftdb-lsm> builds. docs.rs builds asynchronously, so
-     check its build log.
-   - In a scratch project, `cargo add driftdb-lsm` then
-     `cargo run --example quickstart` equivalent.
-7. README badges already point at crates.io and docs.rs; they go live on their own.
+Releases are cut by pushing a `vX.Y.Z` tag. `.github/workflows/release.yml`
+checks the tag against the `driftdb-lsm` version, runs the tests and a publish
+dry run, gets a short-lived crates.io token over OIDC, publishes, and creates the
+GitHub release from the CHANGELOG section. No token is stored anywhere. Never
+publish from a local machine.
 
-## Optional: automate later releases
+### One-time setup
 
-- **Trusted publishing** (crates.io OIDC with GitHub Actions) avoids long-lived
-  tokens. Configure the trusted publisher on crates.io for `Bunty9/driftdb`
-  and workflow `release.yml`. The workflow runs on `push: tags: ['v*']`: it
-  uses `rust-lang/crates-io-auth-action` to get a short-lived token, then
-  `cargo publish`. The first publish must still be manual, because the crate
-  has to exist before a trusted publisher can be attached.
-- Add `cargo semver-checks` to CI once 0.1.0 exists, so accidental API breaks
-  are caught before a patch release.
+1. On crates.io, open `driftdb-lsm` > Settings > Trusted Publishing and add a
+   GitHub publisher: owner `Bunty9`, repository `driftdb`, workflow
+   `release.yml`, environment `release`. The crate must already exist, which it
+   does since 0.1.0.
+2. GitHub environment `release` exists and is restricted to tags matching `v*`
+   (Settings > Environments, or `gh api repos/Bunty9/driftdb/environments/release`).
+   Only a `v*` tag push can run the publish job.
+
+### Per release
+
+1. Bump `version` in `Cargo.toml` (the `driftdb-lsm` package).
+2. In `CHANGELOG.md`, move the `[Unreleased]` items under
+   `## [X.Y.Z] - YYYY-MM-DD` and update the compare links at the bottom.
+3. Commit, and wait for green CI on `main`.
+4. `git tag -a vX.Y.Z -m "driftdb-lsm X.Y.Z"`, then `git push origin vX.Y.Z`.
+5. Watch it: `gh run watch`.
+6. Verify <https://crates.io/crates/driftdb-lsm> and the
+   <https://docs.rs/driftdb-lsm> build log (docs.rs builds asynchronously).
+
+### Optional hardening
+
+- On crates.io, enable "Require trusted publishing" for the crate so API tokens
+  can no longer publish.
+- Revoke the local `cargo login` token.
+- Add `cargo semver-checks` to CI so accidental API breaks are caught before a
+  patch release.
 
 ## After 0.1.0 (not blocking)
 
