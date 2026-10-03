@@ -13,6 +13,10 @@ cargo run -p jobqueue -- crash-demo          # SIGKILL a writer, verify every ac
 cargo run -p jobqueue -- serve --dir ./jobqueue-data --addr 127.0.0.1:3000   # HTTP API
 ```
 
+`demo` and `crash-demo` use a temp directory that they delete afterwards. With `--dir D` the
+directory must be empty or not exist, and it is never deleted (the data is left in place for
+you to inspect); a non-empty `--dir` is refused.
+
 Sample `demo` output (a real run; ids, seqs and temp paths vary, and the mid-run counts in
 step 4 depend on timing):
 

@@ -24,6 +24,7 @@ enum Cmd {
     /// Scripted end-to-end run: producers, workers, failures, snapshot report, backup,
     /// purge + compaction, close and reopen.
     Demo {
+        /// Must be empty or not exist; defaults to a temp dir that is removed afterwards.
         #[arg(long)]
         dir: Option<PathBuf>,
         #[arg(long, default_value_t = 2_000)]
@@ -31,6 +32,7 @@ enum Cmd {
     },
     /// SIGKILL a writer mid-flight, reopen, and verify every acknowledged job survived.
     CrashDemo {
+        /// Must be empty or not exist; defaults to a temp dir that is removed afterwards.
         #[arg(long)]
         dir: Option<PathBuf>,
     },
@@ -56,8 +58,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     match Cli::parse().cmd {
-        Cmd::Demo { dir, jobs } => demo(dir.unwrap_or_else(|| temp_dir("demo")), jobs).await,
-        Cmd::CrashDemo { dir } => crash_demo(dir.unwrap_or_else(|| temp_dir("crash"))).await,
+        Cmd::Demo { dir, jobs } => demo(prepare_scratch_dir(dir, "demo")?, jobs).await,
+        Cmd::CrashDemo { dir } => crash_demo(prepare_scratch_dir(dir, "crash")?).await,
         Cmd::CrashChild { dir } => crash_child(dir).await,
         Cmd::Serve { dir, addr } => serve(dir, addr).await,
     }
@@ -65,6 +67,27 @@ async fn main() -> anyhow::Result<()> {
 
 fn temp_dir(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("jobqueue-{tag}-{}", std::process::id()))
+}
+
+/// Resolve the demo directory. `owned` means we made up the path, so we may delete it afterwards.
+/// A user-supplied directory must be empty or new and is never deleted.
+fn prepare_scratch_dir(dir: Option<PathBuf>, tag: &str) -> anyhow::Result<(PathBuf, bool)> {
+    match dir {
+        None => {
+            let d = temp_dir(tag);
+            let _ = std::fs::remove_dir_all(&d); // stale leftover of this exact temp path
+            Ok((d, true))
+        }
+        Some(d) => {
+            if d.exists() && std::fs::read_dir(&d)?.next().is_some() {
+                bail!(
+                    "{} is not empty; demo commands need an empty or new directory and never delete existing data",
+                    d.display()
+                );
+            }
+            Ok((d, false))
+        }
+    }
 }
 
 /// Small sizes so a short demo actually flushes and compacts.
@@ -81,8 +104,7 @@ fn step(n: u32, text: &str) {
     println!("\n[{n}] {text}");
 }
 
-async fn demo(dir: PathBuf, jobs: u64) -> anyhow::Result<()> {
-    let _ = std::fs::remove_dir_all(&dir);
+async fn demo((dir, owned): (PathBuf, bool), jobs: u64) -> anyhow::Result<()> {
     step(
         1,
         &format!(
@@ -246,14 +268,21 @@ async fn demo(dir: PathBuf, jobs: u64) -> anyhow::Result<()> {
     }
     println!("    identical after reopen: {again:?}");
     reopened.close().await?;
-    std::fs::remove_dir_all(&dir).ok();
-    std::fs::remove_file(&backup).ok();
+    if owned {
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&backup).ok();
+    } else {
+        println!(
+            "\ndata left in {} and backup in {}",
+            dir.display(),
+            backup.display()
+        );
+    }
     println!("\ndemo ok");
     Ok(())
 }
 
-async fn crash_demo(dir: PathBuf) -> anyhow::Result<()> {
-    let _ = std::fs::remove_dir_all(&dir);
+async fn crash_demo((dir, owned): (PathBuf, bool)) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     let mut child = Command::new(exe)
         .args(["crash-child", "--dir"])
@@ -298,7 +327,11 @@ async fn crash_demo(dir: PathBuf) -> anyhow::Result<()> {
     }
     let report = store.report().await?;
     store.close().await?;
-    std::fs::remove_dir_all(&dir).ok();
+    if owned {
+        std::fs::remove_dir_all(&dir).ok();
+    } else {
+        println!("data left in {}", dir.display());
+    }
     if !missing.is_empty() {
         bail!(
             "{} acknowledged jobs were lost: {:?}",
