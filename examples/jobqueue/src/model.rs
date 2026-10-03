@@ -56,6 +56,9 @@ pub struct Job {
     pub payload: serde_json::Value,
     pub status: JobStatus,
     pub attempts: u32,
+    /// Incremented on every claim; fences off workers whose lease expired.
+    #[serde(default)]
+    pub claim_token: u64,
     pub max_attempts: u32,
     /// Unix ms after which a `running` job is considered abandoned.
     pub lease_until: Option<u64>,

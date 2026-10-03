@@ -66,14 +66,14 @@ async fn enqueue_get_complete_lifecycle() {
         (claimed.id, claimed.status, claimed.lease_until),
         (1, JobStatus::Running, Some(1_020))
     );
-    let done = store.complete(1, 30).await.unwrap();
+    let done = store.complete(1, claimed.claim_token, 30).await.unwrap();
     assert_eq!(done.status, JobStatus::Done);
     assert!(matches!(
-        store.complete(1, 40).await,
+        store.complete(1, claimed.claim_token, 40).await,
         Err(StoreError::InvalidState { .. })
     ));
     assert!(matches!(
-        store.complete(99, 40).await,
+        store.complete(99, 0, 40).await,
         Err(StoreError::NotFound(99))
     ));
     assert_eq!(store.get(99).await.unwrap(), None);
@@ -96,14 +96,20 @@ async fn fail_retries_then_dies() {
         )
         .await
         .unwrap();
-    store.claim(1_000, 1).await.unwrap().unwrap();
-    let j = store.fail(1, "boom".into(), 2).await.unwrap();
+    let c = store.claim(1_000, 1).await.unwrap().unwrap();
+    let j = store
+        .fail(1, c.claim_token, "boom".into(), 2)
+        .await
+        .unwrap();
     assert_eq!(
         (j.status, j.attempts, j.last_error.as_deref()),
         (JobStatus::Pending, 1, Some("boom"))
     );
-    store.claim(1_000, 3).await.unwrap().unwrap();
-    let j = store.fail(1, "boom again".into(), 4).await.unwrap();
+    let c = store.claim(1_000, 3).await.unwrap().unwrap();
+    let j = store
+        .fail(1, c.claim_token, "boom again".into(), 4)
+        .await
+        .unwrap();
     assert_eq!((j.status, j.attempts), (JobStatus::Dead, 2));
     assert!(
         store.claim(1_000, 5).await.unwrap().is_none(),
@@ -213,14 +219,17 @@ async fn index_matches_records_after_mixed_ops() {
         t += 1;
         match job.id % 4 {
             0 => {
-                store.complete(job.id, t).await.unwrap();
+                store.complete(job.id, job.claim_token, t).await.unwrap();
             }
             1 => {
-                store.fail(job.id, "x".into(), t).await.unwrap();
+                store
+                    .fail(job.id, job.claim_token, "x".into(), t)
+                    .await
+                    .unwrap();
             }
             2 => {} // abandoned: stays running until the lease expires
             _ => {
-                store.complete(job.id, t).await.unwrap();
+                store.complete(job.id, job.claim_token, t).await.unwrap();
             }
         }
         if job.id % 50 == 0 {
@@ -242,5 +251,33 @@ async fn index_matches_records_after_mixed_ops() {
             job.status
         );
     }
+    store.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn stale_worker_is_fenced_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = JobStore::open(dir.path(), Options::default())
+        .await
+        .unwrap();
+    store.enqueue(new_job(1), 0).await.unwrap();
+    let a = store.claim(100, 1_000).await.unwrap().unwrap().claim_token;
+    assert_eq!(store.requeue_expired(1_100).await.unwrap(), 1);
+    let b = store.claim(100, 1_200).await.unwrap().unwrap().claim_token;
+    assert_eq!(b, a + 1);
+    assert!(matches!(
+        store.complete(1, a, 1_300).await,
+        Err(StoreError::LeaseLost { id: 1 })
+    ));
+    assert!(matches!(
+        store.fail(1, a, "late".into(), 1_300).await,
+        Err(StoreError::LeaseLost { id: 1 })
+    ));
+    let j = store.get(1).await.unwrap().unwrap();
+    assert_eq!((j.status, j.attempts), (JobStatus::Running, 0));
+    assert_eq!(
+        store.complete(1, b, 1_400).await.unwrap().status,
+        JobStatus::Done
+    );
     store.close().await.unwrap();
 }

@@ -3,6 +3,8 @@
 //! * One `driftdb::Db`, cloned freely (it is an `Arc` handle) and shared by every task.
 //! * Every state change is ONE `WriteBatch` (record + index + counter), so a crash can never
 //!   leave a job half-moved. driftdb acks a batch only after `fdatasync`.
+//! * `claim` bumps a per-job `claim_token`; `complete`/`fail` must present it, so a worker whose
+//!   lease expired cannot finish or fail a job that someone else has re-claimed.
 //! * driftdb has no compare-and-swap or transactions. Anything that reads state and writes
 //!   based on it (allocate an id, claim, complete, fail, requeue) runs under one async
 //!   mutex; plain reads take no lock. Without it two workers could claim the same job.
@@ -32,6 +34,8 @@ pub enum StoreError {
         status: JobStatus,
         expected: JobStatus,
     },
+    #[error("job {id} was re-claimed by another worker (stale claim_token)")]
+    LeaseLost { id: u64 },
     #[error("payload is {size} bytes; the limit is {limit}")]
     PayloadTooLarge { size: usize, limit: usize },
     #[error("{}", describe_db_error(.0))]
@@ -99,6 +103,7 @@ impl JobStore {
             payload: new.payload,
             status: JobStatus::Pending,
             attempts: 0,
+            claim_token: 0,
             max_attempts: new.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS).max(1),
             lease_until: None,
             created_at: now,
@@ -144,7 +149,8 @@ impl JobStore {
             .ok_or_else(|| StoreError::CorruptIndex(String::from_utf8_lossy(key).into()))?;
         let mut job = self.get(id).await?.ok_or(StoreError::NotFound(id))?;
         job.status = JobStatus::Running;
-        job.lease_until = Some(now + lease_ms);
+        job.claim_token += 1;
+        job.lease_until = Some(now.saturating_add(lease_ms));
         job.updated_at = now;
         self.db
             .write_batch(move_batch(WriteBatch::new(), JobStatus::Pending, &job)?)
@@ -152,9 +158,9 @@ impl JobStore {
         Ok(Some(job))
     }
 
-    pub async fn complete(&self, id: u64, now: u64) -> Result<Job> {
+    pub async fn complete(&self, id: u64, claim_token: u64, now: u64) -> Result<Job> {
         let _guard = self.write.lock().await;
-        let mut job = self.running_job(id).await?;
+        let mut job = self.owned_running_job(id, claim_token).await?;
         job.status = JobStatus::Done;
         job.lease_until = None;
         job.updated_at = now;
@@ -164,9 +170,9 @@ impl JobStore {
         Ok(job)
     }
 
-    pub async fn fail(&self, id: u64, error: String, now: u64) -> Result<Job> {
+    pub async fn fail(&self, id: u64, claim_token: u64, error: String, now: u64) -> Result<Job> {
         let _guard = self.write.lock().await;
-        let mut job = self.running_job(id).await?;
+        let mut job = self.owned_running_job(id, claim_token).await?;
         job.attempts += 1;
         job.status = if job.attempts >= job.max_attempts {
             JobStatus::Dead
@@ -235,8 +241,11 @@ impl JobStore {
         Ok(self.db.close().await?)
     }
 
-    async fn running_job(&self, id: u64) -> Result<Job> {
+    async fn owned_running_job(&self, id: u64, claim_token: u64) -> Result<Job> {
         let job = self.get(id).await?.ok_or(StoreError::NotFound(id))?;
+        if job.claim_token != claim_token {
+            return Err(StoreError::LeaseLost { id });
+        }
         if job.status != JobStatus::Running {
             return Err(StoreError::InvalidState {
                 id,
