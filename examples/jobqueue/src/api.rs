@@ -4,7 +4,8 @@
 use crate::model::{JobStatus, NewJob};
 use crate::now_ms;
 use crate::store::{JobStore, StoreError};
-use axum::extract::{Path, Query, State};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -33,7 +34,32 @@ pub fn router(store: JobStore) -> Router {
 pub enum ApiError {
     Store(StoreError),
     BadRequest(String),
+    /// An extractor rejection (bad JSON, bad path, bad query), keeping axum's status.
+    Rejection(StatusCode, String),
 }
+
+// Wrapper extractors so every client mistake gets the same JSON `{"error": ..}` body,
+// instead of axum's default text/plain rejections.
+#[derive(axum::extract::FromRequest)]
+#[from_request(via(axum::Json), rejection(ApiError))]
+struct AppJson<T>(T);
+#[derive(axum::extract::FromRequestParts)]
+#[from_request(via(axum::extract::Path), rejection(ApiError))]
+struct AppPath<T>(T);
+#[derive(axum::extract::FromRequestParts)]
+#[from_request(via(axum::extract::Query), rejection(ApiError))]
+struct AppQuery<T>(T);
+
+macro_rules! from_rejection {
+    ($($t:ty),*) => {$(
+        impl From<$t> for ApiError {
+            fn from(r: $t) -> Self {
+                ApiError::Rejection(r.status(), r.body_text())
+            }
+        }
+    )*};
+}
+from_rejection!(JsonRejection, PathRejection, QueryRejection);
 
 impl From<StoreError> for ApiError {
     fn from(e: StoreError) -> Self {
@@ -45,6 +71,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, msg) = match self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            ApiError::Rejection(status, m) => (status, m),
             ApiError::Store(e) => {
                 let status = match &e {
                     StoreError::NotFound(_) => StatusCode::NOT_FOUND,
@@ -68,7 +95,7 @@ type ApiResult<T> = Result<T, ApiError>;
 
 async fn create(
     State(store): State<JobStore>,
-    Json(new): Json<NewJob>,
+    AppJson(new): AppJson<NewJob>,
 ) -> ApiResult<(StatusCode, Json<crate::model::Job>)> {
     Ok((
         StatusCode::CREATED,
@@ -87,12 +114,15 @@ fn default_limit() -> usize {
     50
 }
 
-async fn list(State(store): State<JobStore>, Query(q): Query<ListQuery>) -> ApiResult<Response> {
+async fn list(
+    State(store): State<JobStore>,
+    AppQuery(q): AppQuery<ListQuery>,
+) -> ApiResult<Response> {
     let status: JobStatus = q.status.parse().map_err(ApiError::BadRequest)?;
     Ok(Json(store.list(status, q.limit.min(1_000)).await?).into_response())
 }
 
-async fn get_job(State(store): State<JobStore>, Path(id): Path<u64>) -> ApiResult<Response> {
+async fn get_job(State(store): State<JobStore>, AppPath(id): AppPath<u64>) -> ApiResult<Response> {
     let job = store.get(id).await?.ok_or(StoreError::NotFound(id))?;
     Ok(Json(job).into_response())
 }
@@ -107,7 +137,10 @@ fn default_lease() -> u64 {
     30_000
 }
 
-async fn claim(State(store): State<JobStore>, Json(body): Json<ClaimBody>) -> ApiResult<Response> {
+async fn claim(
+    State(store): State<JobStore>,
+    AppJson(body): AppJson<ClaimBody>,
+) -> ApiResult<Response> {
     Ok(match store.claim(body.lease_ms, now_ms()).await? {
         Some(job) => Json(job).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),
@@ -123,8 +156,8 @@ struct CompleteBody {
 
 async fn complete(
     State(store): State<JobStore>,
-    Path(id): Path<u64>,
-    Json(body): Json<CompleteBody>,
+    AppPath(id): AppPath<u64>,
+    AppJson(body): AppJson<CompleteBody>,
 ) -> ApiResult<Response> {
     Ok(Json(store.complete(id, body.claim_token, now_ms()).await?).into_response())
 }
@@ -137,8 +170,8 @@ struct FailBody {
 
 async fn fail(
     State(store): State<JobStore>,
-    Path(id): Path<u64>,
-    Json(body): Json<FailBody>,
+    AppPath(id): AppPath<u64>,
+    AppJson(body): AppJson<FailBody>,
 ) -> ApiResult<Response> {
     Ok(Json(
         store
