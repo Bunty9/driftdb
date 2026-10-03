@@ -19,12 +19,17 @@ include = [
     "/src",
     "/tests",
     "/benches",
-    "/examples",
+    "/examples/quickstart.rs",
     "/README.md",
     "/CHANGELOG.md",
     "/LICENSE-MIT",
     "/LICENSE-APACHE",
 ]
+
+[workspace]
+members = ["examples/jobqueue"]
+# MSRV-aware dependency resolution so the shared lockfile keeps the library buildable on 1.85.
+resolver = "3"
 
 [lib]
 name = "driftdb"
