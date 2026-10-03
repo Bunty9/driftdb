@@ -153,9 +153,11 @@ async fn bad_input_is_4xx_never_500() {
     let (s, body) = call(&app, "GET", "/jobs?status=bogus", None).await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
     assert!(body["error"].as_str().unwrap().contains("unknown status"));
-    assert_eq!(
-        call(&app, "GET", "/jobs/abc", None).await.0,
-        StatusCode::BAD_REQUEST
+    let (s, body) = call(&app, "GET", "/jobs/abc", None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"].is_string(),
+        "path rejection must be JSON: {body}"
     );
 
     let req = Request::builder()
@@ -164,13 +166,18 @@ async fn bad_input_is_4xx_never_500() {
         .header("content-type", "application/json")
         .body(Body::from("{not json"))
         .unwrap();
-    assert!(app
-        .clone()
-        .oneshot(req)
-        .await
-        .unwrap()
-        .status()
-        .is_client_error());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert!(res.status().is_client_error());
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).expect("rejection body is JSON");
+    assert!(body["error"].is_string());
+
+    let (s, body) = call(&app, "POST", "/jobs/1/complete", Some(json!({}))).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        body["error"].is_string(),
+        "missing-field rejection must be JSON: {body}"
+    );
 
     let huge = json!({"kind": "x", "payload": "y".repeat(jobqueue::store::MAX_PAYLOAD_BYTES + 1)});
     assert_eq!(
