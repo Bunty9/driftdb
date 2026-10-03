@@ -1,7 +1,8 @@
 # jobqueue: a durable job queue on driftdb-lsm
 
 A reference integration for [`driftdb-lsm`](../../README.md): a small job queue
-(enqueue, claim with a lease, complete, fail with retries, dead-letter) with a typed
+(enqueue, claim with a lease, complete, fail with retries, dead-letter; a lease that
+expires counts as a failed attempt, so a job whose worker keeps crashing ends up dead) with a typed
 store, a secondary index, snapshot reads, an HTTP API and a crash test. Read
 `src/store.rs` first; it is the part to copy.
 
@@ -21,7 +22,7 @@ Sample `demo` output (a real run; ids, seqs and temp paths vary, and the mid-run
 step 4 depend on timing):
 
 ```text
-[1] open /tmp/jobqueue-demo-1175042 with small Options so flushes/compactions happen
+[1] open /tmp/jobqueue-demo-1254035 with small Options so flushes/compactions happen
 
 [2] a worker claims one job with a 1s lease and then 'crashes' (never finishes it)
     job 1 is running with nobody working on it
@@ -38,12 +39,12 @@ step 4 depend on timing):
     final: {"dead": 30, "done": 271, "pending": 0, "running": 0}
 
 [6] online backup: export every job from a snapshot to JSONL
-    wrote 301 jobs to /tmp/jobqueue-demo-1175042.jsonl
+    wrote 301 jobs to /tmp/jobqueue-demo-1254035.jsonl
 
 [7] purge done jobs, then flush + full compaction to drop their tombstones
     purged 271
-    before: files per level [1], write amp 1.72x
-    after:  files per level [0, 0, 0, 0, 0, 0, 1], write amp 4.51x
+    before: files per level [1], 155737 SST bytes, write amp 1.72x
+    after:  files per level [0, 0, 0, 0, 0, 0, 1], 127712 SST bytes, write amp 4.51x
 
 [8] close, reopen, and check nothing changed (recovery)
     identical after reopen: {"dead": 30, "done": 0, "pending": 0, "running": 0}
@@ -96,20 +97,24 @@ c. **There is no compare-and-swap.** Serialize read-modify-write behind a lock (
 d. **`Snapshot::get` and `Snapshot::scan` are synchronous.** Call them from
    `tokio::task::spawn_blocking` (see `report_at` and `export`), not directly on the async
    executor.
-e. **`scan` returns a `Vec`.** The whole range is materialized, so bound your ranges (the
-   API caps `limit` at 1000).
+e. **`scan` returns a `Vec`.** The whole range is materialized. `limit` caps the response, not
+   the scan — bound the key range itself.
 f. **One process per directory.** A second `open` fails with `Error::Locked`; `JobStore::open`
    turns that into a readable message.
 g. **Call `close().await` on shutdown.** It drains the writer and flushes memtables.
    Dropping the last handle also works, but it blocks the thread doing the drop.
-h. **Deletes are tombstones until compaction.** `purge` frees nothing by itself; see the
-   before/after in demo step 7 after `maintenance` (flush + full compaction).
+h. **Deletes are tombstones until compaction.** `purge` frees nothing by itself; compaction
+   reclaims them, so total SST bytes drop after purge plus `maintenance` (flush + full
+   compaction), as demo step 7 prints. Write amp is cumulative over the engine's lifetime, so
+   it only goes up: the full compaction rewrites data and raises it.
 
 ### Known limitations
 
 - Each `claim` scans the whole pending index to take its first entry (marked `ponytail` in
   `store.rs`); fine for thousands of pending jobs, not millions.
-- There is one global write lock, so state transitions run one at a time.
+- There is one global write lock, so each state transition pays its own `fdatasync`, one at
+  a time. These operations do not benefit from driftdb's group commit; shard the lock or
+  batch transitions if write throughput matters.
 - Linux only, like the library.
 
 ## HTTP API
@@ -138,5 +143,5 @@ curl -s 'localhost:3000/jobs?status=done&limit=10'
 curl -s localhost:3000/report
 ```
 
-`serve` also requeues jobs whose lease expired, every 5 seconds. Stop it with Ctrl-C; it
+`serve` also requeues jobs whose lease expired, every 5 seconds. Stop it with Ctrl-C or SIGTERM; it
 shuts down gracefully.

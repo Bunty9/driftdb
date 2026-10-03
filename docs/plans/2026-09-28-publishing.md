@@ -1,6 +1,6 @@
-# Publishing plan: `driftdb-lsm` 0.1.0 on crates.io
+# Publishing and releasing `driftdb-lsm` on crates.io
 
-Status: **done**. `driftdb-lsm` 0.1.0 was published to crates.io on 2026-09-28, tagged `v0.1.0`, with a GitHub release. The blockers below were all fixed before publishing.
+Status: **ongoing**; this doc covers the release procedure. `driftdb-lsm` 0.1.0 was published to crates.io on 2026-09-28, tagged `v0.1.0`, with a GitHub release. The blockers below were all fixed before publishing.
 Publishing is irreversible: a version can be yanked but never deleted or
 re-uploaded. So every step marked **(owner)** needs the crate owner to act or
 approve.
@@ -14,7 +14,7 @@ approve.
 | License | `MIT OR Apache-2.0` | Rust ecosystem default. `LICENSE-MIT` and `LICENSE-APACHE` are in the repo root and in the package. README has the standard contribution clause. |
 | MSRV | `rust-version = "1.85"` | The highest `rust-version` among normal dependencies (getrandom, jobserver). Verified with `cargo +1.85.0 check` and `test --no-run`; CI job `msrv (1.85)` keeps it honest. |
 | Platform | Linux only | `libc::fdatasync` does not exist on Apple targets, and Windows has neither fdatasync nor flock. `lib.rs` has a `compile_error!` for non-Linux targets; docs.rs builds `x86_64-unknown-linux-gnu` only. |
-| Package contents | `include = [src, tests, benches, examples, README, CHANGELOG, LICENSE-*]` | Design notes, CI config and CLAUDE.md stay repo-only. `cargo package --list` shows 24 files. |
+| Package contents | `include = [src, tests, benches, examples/quickstart.rs, README, CHANGELOG, LICENSE-*]` | Design notes, CI config and CLAUDE.md stay repo-only. `cargo package --list` shows 24 files. |
 | Versioning | SemVer, `0.x` | While `0.x`, a minor bump may break the API **or the on-disk format** (stated in CHANGELOG.md). |
 
 Verified locally: `cargo publish --dry-run` passes, and `cargo doc --no-deps`
@@ -72,6 +72,8 @@ publish from a local machine.
 2. GitHub environment `release` exists and is restricted to tags matching `v*`
    (Settings > Environments, or `gh api repos/Bunty9/driftdb/environments/release`).
    Only a `v*` tag push can run the publish job.
+
+Recovery: if crates.io published but the GitHub release step failed, run `gh release create vX.Y.Z --notes-file <section>` by hand; re-running the job fails at `cargo publish`.
 
 ### Per release
 

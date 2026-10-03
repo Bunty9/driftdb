@@ -46,6 +46,10 @@ beta. The beta leg overrides `rust-toolchain.toml` via `RUSTUP_TOOLCHAIN`. CI al
 `cargo deny check`, `cargo bench --no-run`, an MSRV `cargo check`, and
 `cargo doc` (with `-D warnings`) plus `cargo publish --dry-run`.
 
+The repo root is a Cargo workspace (the library plus `examples/jobqueue`). Root `cargo test`
+tests only the library; use `cargo test -p jobqueue` and `cargo run -p jobqueue -- demo` for
+the example (add `--workspace` to cover both).
+
 ## Architecture (big picture)
 
 Module layering, from bottom to top:

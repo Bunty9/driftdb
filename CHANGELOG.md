@@ -9,8 +9,15 @@ bump (`0.1` to `0.2`) may break the API **or the on-disk format**.
 
 ### Added
 
-- `examples/jobqueue`: reference integration (typed store, secondary index, snapshots,
-  HTTP API, crash demo).
+- `examples/jobqueue`: reference integration of a durable job queue (typed store, secondary
+  index, atomic record-plus-index batches, snapshot reads, HTTP API, `kill -9` crash demo,
+  claim-token fencing so a stale worker cannot overwrite a re-claimed job).
+- Tag-triggered release workflow that publishes to crates.io with trusted publishing.
+
+### Changed
+
+- The package `include` now ships only `examples/quickstart.rs`; the repo root is a Cargo
+  workspace.
 
 ## [0.1.0] - 2026-09-28
 
