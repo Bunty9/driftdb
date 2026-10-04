@@ -16,9 +16,15 @@ jobs:
       id-token: write   # OIDC token exchanged for a short-lived crates.io token
       contents: write   # create the GitHub release
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # Actions are pinned to commit SHAs (Dependabot keeps them current) and no build cache is
+      # restored: this job holds the OIDC publish token, so it must not run code or caches that an
+      # untrusted CI run could have influenced.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
       - name: Tag must match Cargo.toml version
         run: |
           tag="${GITHUB_REF_NAME#v}"
@@ -28,7 +34,7 @@ jobs:
         run: cargo test -p driftdb-lsm
       - name: Dry run
         run: cargo publish -p driftdb-lsm --dry-run
-      - uses: rust-lang/crates-io-auth-action@v1
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
       - name: Publish
         run: cargo publish -p driftdb-lsm
